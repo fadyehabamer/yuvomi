@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The calendar mirrors fully in right-to-left languages.** In Arabic and Persian the week
+  view drew the column lines of the all-day row 1px beside those of the time grid, the month
+  grid drew a line along its outer right edge and only a thin one between its two leftmost days,
+  the hour labels and the "All day" label sat against the outer edge instead of the grid, the red
+  now line in the day view ran across the hour column with its dot on the wrong end, and nested
+  calendar filters were indented from the left. The avatars on all-day entries now sit at the end of
+  the line again instead of right after the title. Left-to-right layouts are unchanged.
+
 ## [2.71.0] - 2026-09-30
 
 ### Added

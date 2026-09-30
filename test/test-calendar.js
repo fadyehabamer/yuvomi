@@ -4285,6 +4285,48 @@ test('Baender in RTL: offene Kante, Chevron und Nachbarmonat-Toenung kippen mit 
   const rtl = rule('[dir="rtl"] .month-bands > .cal-band--outside');
   assert(/--band-to:\s*left/.test(rtl.body), 'in RTL laeuft der Verlauf von rechts nach links');
 });
+test('Kalender in RTL: Fugen, Zeitspalte, Jetzt-Linie und Einzuege haengen an keiner physischen Seite', () => {
+  // Unter dir="rtl" steht die Zeitspalte rechts und Spalte 1 des Rasters
+  // ebenfalls. Eine Fuge per border-left, ein Einzug per margin-left oder
+  // eine Jetzt-Linie ab `left: <Zeitspalte>` bleibt dann auf der LTR-Seite:
+  // die Linien der Ganztags-Zeile laufen 1px neben denen des Zeitrasters, die
+  // Monatszelle zieht eine Linie an den Aussenrand, die Beschriftung klebt an
+  // der falschen Kante, und die Jetzt-Linie ueberdeckt die Zeitspalte.
+  const top = [...eachRule(calendarCss)].filter((r) => r.at.length === 0);
+  const rule = (sel) => {
+    const found = top.filter((r) => r.selector.trim() === sel);
+    assert(found.length > 0, `Regel nicht gefunden: ${sel}`);
+    return found.map((r) => r.body).join(';');
+  };
+  const physical = /(?:^|[;\s])(?:margin|padding|border)-(?:left|right)\b|(?:^|[;\s])(?:left|right)\s*:|text-align:\s*(?:left|right)\b/;
+  const expect = {
+    '.month-day': /border-inline-end:/,
+    '.month-day:nth-child(7n)': /border-inline-end:\s*none/,
+    '.week-view__day-header': /border-inline-start:/,
+    '.week-view__col': /border-inline-start:/,
+    '.day-view__col': /border-inline-start:/,
+    '.allday-cell': /border-inline-start:/,
+    '.allday-row--week .allday-cell': /border-inline-start:\s*0/,
+    '.week-view__time-slot': /padding-inline-end:/,
+    '.calendar-all-day-label': /text-align:\s*end/,
+    '.week-view__now-line::before': /inset-inline-start:/,
+    '.day-view__now-line': /inset-inline:\s*var\(--cal-gutter-width\)\s+0/,
+    '.day-view__now-dot': /inset-inline-start:/,
+    '.cal-chip__assigned': /margin-inline-start:\s*auto/,
+    '.cal-filters__nested': /margin-inline-start:/,
+    '.event-icon-dialog__results': /padding-inline-end:/,
+  };
+  for (const [sel, logical] of Object.entries(expect)) {
+    const body = rule(sel);
+    assert(!physical.test(body), `${sel} haengt an einer physischen Seite: ${body}`);
+    assert(logical.test(body), `${sel} traegt die logische Eigenschaft nicht: ${body}`);
+  }
+  // Die Beschriftung der Ganztags-Zeile: vier Werte in `padding` waeren
+  // ebenso seitenfest wie padding-left/-right.
+  assert(!/(?:^|[;\s])padding\s*:\s*\S+\s+\S+\s+\S+\s+\S+/.test(rule('.calendar-all-day-label')),
+    'die Ganztags-Beschriftung setzt ihren Innenabstand ueber padding-inline, nicht ueber vier Werte');
+});
+
 test('Monatszelle: der Fokusring liegt ueber der Band-Schicht, die Zelle nicht', () => {
   // Ein Band liegt in `.month-bands` (z-index 1) ueber den Zellen. Hob sich die
   // fokussierte Zelle mit z-index 1 an, malte die spaetere Schicht trotzdem

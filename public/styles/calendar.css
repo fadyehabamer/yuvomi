@@ -431,7 +431,7 @@
 }
 
 .month-day {
-  border-right: var(--space-px) solid var(--color-border-subtle);
+  border-inline-end: var(--space-px) solid var(--color-border-subtle);
   border-bottom: var(--space-px) solid var(--color-border-subtle);
   background-color: var(--color-surface-work);
   padding: var(--space-1);
@@ -442,7 +442,7 @@
 }
 
 .month-day:nth-child(7n) {
-  border-right: none;
+  border-inline-end: none;
 }
 
 .month-day:hover {
@@ -594,7 +594,7 @@
 .cal-chip__assigned {
   display: inline-flex;
   align-items: center;
-  margin-left: auto;
+  margin-inline-start: auto;
   flex-shrink: 0;
 }
 
@@ -691,7 +691,7 @@
   gap: var(--space-1h);
   padding: var(--space-1h) var(--space-1);
   text-align: center;
-  border-left: 1px solid var(--color-border-subtle);
+  border-inline-start: 1px solid var(--color-border-subtle);
   cursor: pointer;
 }
 
@@ -747,7 +747,7 @@
 
 .week-view__time-slot {
   height: var(--cal-hour-height);
-  padding-right: var(--space-2);
+  padding-inline-end: var(--space-2);
   display: flex;
   align-items: flex-start;
   justify-content: flex-end;
@@ -768,7 +768,7 @@
 }
 
 .week-view__col {
-  border-left: 1px solid var(--color-border-subtle);
+  border-inline-start: 1px solid var(--color-border-subtle);
   position: relative;
 }
 
@@ -855,7 +855,7 @@
 .week-view__now-line::before {
   content: '';
   position: absolute;
-  left: -4px;
+  inset-inline-start: -4px;
   top: -4px;
   width: 10px;
   height: 10px;
@@ -1163,7 +1163,7 @@
 
 .day-view__col {
   flex: 1;
-  border-left: 1px solid var(--color-border-subtle);
+  border-inline-start: 1px solid var(--color-border-subtle);
   position: relative;
 }
 
@@ -1301,8 +1301,7 @@
  * position:relative OHNE z-index und öffnet deshalb keinen eigenen). */
 .day-view__now-line {
   position: absolute;
-  left: var(--cal-gutter-width);
-  right: 0;
+  inset-inline: var(--cal-gutter-width) 0;
   height: 2px;
   background-color: var(--color-danger);
   z-index: 0;
@@ -1311,7 +1310,7 @@
 
 .day-view__now-dot {
   position: absolute;
-  left: calc(var(--cal-gutter-width) - 5px);
+  inset-inline-start: calc(var(--cal-gutter-width) - 5px);
   width: 10px;
   height: 10px;
   margin-top: -4px;
@@ -1724,7 +1723,7 @@
   gap: var(--space-3);
   max-height: min(60vh, 520px);
   overflow-y: auto;
-  padding-right: var(--space-1);
+  padding-inline-end: var(--space-1);
 }
 
 /* Das Feld ist die geteilte Suchkapsel (renderPageSearch); hier nur der Abstand. */
@@ -2009,10 +2008,11 @@
  * Balken daneben. */
 .calendar-all-day-label {
   width: var(--cal-gutter-width);
-  padding: var(--space-1h) var(--space-2) var(--space-1h) var(--space-1);
+  padding-block: var(--space-1h);
+  padding-inline: var(--space-1) var(--space-2);
   font-size: var(--text-xs);
   color: var(--color-text-secondary);
-  text-align: right;
+  text-align: end;
   line-height: var(--line-height-tight);
   overflow-wrap: anywhere;
 }
@@ -2035,7 +2035,7 @@
 }
 
 .allday-cell {
-  border-left: var(--space-px) solid var(--color-border-subtle);
+  border-inline-start: var(--space-px) solid var(--color-border-subtle);
   padding: var(--space-0h);
   min-width: 0;
   overflow: hidden;
@@ -2210,7 +2210,7 @@
 }
 
 .allday-row--week .allday-cell {
-  border-left: 0;
+  border-inline-start: 0;
 }
 
 .allday-row--week > .cal-band {
@@ -3043,7 +3043,7 @@
    traegt die Beziehung, keine eigene Umrandung - sonst saehe es aus wie eine
    zweite eigene Gruppe statt einer Unterliste EINER Zeile. */
 .cal-filters__nested {
-  margin-left: var(--space-5);
+  margin-inline-start: var(--space-5);
   margin-top: var(--space-1);
   display: flex;
   flex-direction: column;
