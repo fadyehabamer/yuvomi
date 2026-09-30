@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the hour labels and the "All day" label sat against the outer edge instead of the grid, the red
   now line in the day view ran across the hour column with its dot on the wrong end, and nested
   calendar filters were indented from the left. The avatars on all-day entries now sit at the end of
-  the line again instead of right after the title. Left-to-right layouts are unchanged.
+  the line instead of right after the title, and the compact month dots start at the edge of the
+  day. Left-to-right layouts are unchanged.
 
 ## [2.71.0] - 2026-09-30
 

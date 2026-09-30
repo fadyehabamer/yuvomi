@@ -1991,10 +1991,10 @@
 
 /* Die Beschriftung füllt die Zeitspalte, statt 48px in einer 64px-Spur zu
  * stehen. #920 hat die SPUR auf --cal-gutter-width gebracht, die Beschriftung
- * darin blieb auf --space-12: sie ist rechtsbündig, endete also 16px zu früh
+ * darin blieb auf --space-12: sie ist endbündig, endete also 16px zu früh
  * und stand damit weiter neben den Stundenzahlen, die genau darunter beginnen.
- * Ihr padding-right ist deshalb dasselbe wie in .week-view__time-slot - beide
- * Texte enden auf derselben senkrechten Kante.
+ * Ihr padding-inline-end ist deshalb dasselbe wie in .week-view__time-slot -
+ * beide Texte enden auf derselben senkrechten Kante, in RTL auf der linken.
  *
  * DIE BESCHRIFTUNG DARF UMBRECHEN (Critique 2026-09-24). „ganztg." war 42,5px
  * breit und stand in der 44px-Spalte des Telefons buendig an der
@@ -2020,7 +2020,7 @@
 /* In der 44px-Spalte (mobil) rueckt die Beschriftung 4px vom Raster ab statt
  * 8px: „08:00" braucht 34px, und mit 8px Abstand klebte die Ziffer 2px an der
  * Bildschirmkante. Stundenzahl und Ganztags-Beschriftung behalten dieselbe
- * rechte Kante (test-calendar.js), also aendern sich beide zusammen. Die
+ * Endkante (test-calendar.js), also aendern sich beide zusammen. Die
  * Beschriftung haelt zusaetzlich 2px Abstand zur Bildschirmkante: ein Wort,
  * das die Spalte fuellt, bricht vorher um (am Desktop 4px, hier 2px). */
 @media (max-width: 639px) {
@@ -2193,8 +2193,7 @@
 /* Steht das „bis" in der Zeile, schiebt ES ans Ende; die Zugewiesenen folgen
  * ihm, statt mit einem zweiten auto-Rand den freien Platz zu teilen. */
 .cal-band__until + .cal-chip__assigned {
-  margin-left: 0;
-  margin-right: 0;
+  margin-inline: 0;
 }
 
 [dir="rtl"] .cal-band__cont {
@@ -2560,7 +2559,8 @@
     height: var(--space-2h);
     min-width: var(--space-2h);
     padding: 0;
-    margin: 0 var(--space-0h) var(--space-0h) 0;
+    margin-block: 0 var(--space-0h);
+    margin-inline: 0 var(--space-0h);
     border: none;
     box-shadow: none;
     border-radius: var(--radius-full);
