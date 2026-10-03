@@ -12,7 +12,7 @@ import { openDetailView } from '/components/detail-view.js';
 import { stagger, vibrate, scheduleUndoableDelete } from '/utils/ux.js';
 import { wireTablist } from '/utils/tablist.js';
 import { attachSegmentIndicator } from '/utils/segment-indicator.js';
-import { t, formatDate, formatDayMonth, getLocale, getNumberFormat } from '/i18n.js';
+import { t, formatDate, formatDayMonth, formatMonthYear, getLocale, getNumberFormat } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
 import { render as renderSplitExpenses, prefillSplitExpense, canAddSplitExpense, openNewSplitExpense } from '/pages/split-expenses.js';
@@ -432,9 +432,11 @@ function loanBudgetEquivalent(n, loan) {
   return t('budget.loanConvertedAmount', { amount: formatAmount(Number(n || 0) * Number(loan.exchange_rate || 1)) });
 }
 
+// Reihenfolge und Fuegung von Monat und Jahr kommen aus der Sprache (#1607),
+// nicht aus einem Leerzeichen zwischen zwei Teilen.
 function formatMonthLabel(ym) {
   const [y, m] = ym.split('-');
-  return `${getMonthName(parseInt(m, 10) - 1)} ${y}`;
+  return formatMonthYear(y, m);
 }
 
 function addMonths(ym, n) {
@@ -1113,7 +1115,9 @@ function renderBody() {
     : s.balance >= 0
       ? 'metric-card--balance-positive'
       : 'metric-card--balance-negative';
-  const prevLabel = p ? formatMonthLabel(p.month).split(' ')[0].slice(0, 3) : '';
+  // Der Monatsname selbst, nicht das erste Wort des Labels: wo die Sprache das
+  // Jahr voranstellt ("2026년 10월"), waere das erste Wort das Jahr (#1607).
+  const prevLabel = p ? getMonthName(parseInt(p.month.split('-')[1], 10) - 1).slice(0, 3) : '';
 
   /* EIN MONAT, DER NOCH KOMMT, IST EINE PROGNOSE (Critique 2026-09-25). Seine
    * Buchungen sind Serien, die der Server beim Aufruf fuer den Monat anlegt -
@@ -4524,6 +4528,13 @@ function occurrenceSeriesBody(body, entry) {
  * Verglichen wird mit dem, was das Formular zeigt: bei einer virtuellen Serie
  * ist das der Periodenbetrag, nicht der Monatsanteil in `amount`.
  *
+ * Das DATUM gehoert wie der Rhythmus hierher (#1545): die Serie hat einen
+ * eigenen Starttag, und nur von der ersten Buchung aus laesst er sich
+ * verlegen. Geht nur mit, wenn es hier geaendert wurde - nach einer
+ * Einzelkorrektur ("abgebucht am 6., nicht am 5.") zeigt das Formular das
+ * Datum der Buchung, nicht den Starttag, und unveraendert mitgeschickt
+ * verschoebe es das Raster der ganzen Serie.
+ *
  * @param {object} body   der Body, den der Dialog gebaut hat
  * @param {object} entry  die erste Buchung der Serie
  * @returns {object}
@@ -4532,12 +4543,15 @@ function anchorSeriesBody(body, entry) {
   const shown = entry.recurrence_virtual && entry.recurrence_full_amount != null
     ? entry.recurrence_full_amount
     : entry.amount;
-  return changedSeriesBody(body, entry, { amount: Number(shown), keepRhythm: true });
+  const out = changedSeriesBody(body, entry, { amount: Number(shown), keepRhythm: true });
+  if (body.date && body.date !== entry.date) out.start_date = body.date;
+  return out;
 }
 
 /**
  * Nur die Werte, die im Formular von `entry` abweichen; Datum und Belege nie
- * (sie gehoeren der einzelnen Buchung), den Rhythmus nur mit `keepRhythm`.
+ * (sie gehoeren der einzelnen Buchung - den Starttag der Serie setzt
+ * anchorSeriesBody() eigens), den Rhythmus nur mit `keepRhythm`.
  */
 function changedSeriesBody(body, entry, { amount, keepRhythm }) {
   const before = {

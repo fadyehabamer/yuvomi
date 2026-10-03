@@ -9937,6 +9937,158 @@ const MIGRATIONS = [
       END;
     `,
   },
+  {
+    version: 229,
+    description: 'Budget: a series keeps its own start date (#1545)',
+    // DER STARTTAG WAR NOCH DAS DATUM DER ERSTEN BUCHUNG (#1545). v228 hat die
+    // Werte der Vorlage vom Anker getrennt, den Starttag aber dort gelassen:
+    // occurrenceDatesInMonth() leitet jedes spaetere Vorkommen (Tag im Monat,
+    // Wochentag, das "alle N"-Raster) aus ihm ab. Eine Korrektur NUR der ersten
+    // Buchung ("abgebucht wurde am 6., nicht am 5.") verschob deshalb das
+    // Raster jedes Vorkommens, das noch nicht angelegt war, und bei Wochen-
+    // oder "alle N"-Serien sogar, welche Tage es ueberhaupt gibt.
+    //
+    // Die Definition bekommt ihren eigenen Starttag. Gefuellt aus dem Datum des
+    // Ankers - das war bis hierher der Starttag, jede Serie behaelt also genau
+    // ihr Raster. Die Trigger aus v228 legen neue Definitionen an; sie werden
+    // hier mit derselben Bedingung neu angelegt und nehmen den Starttag aus
+    // der Buchung mit (DROP + CREATE, weil ein Trigger sich nicht aendern
+    // laesst). Ein kuenftiger Rebuild von budget_entries verliert sie weiter
+    // mit der Tabelle, siehe v228.
+    //
+    // NULL-faehig, weil ADD COLUMN ein NOT NULL nur mit Vorgabewert nimmt, und
+    // jeder Vorgabewert waere ein erfundener Starttag. Geschrieben wird die
+    // Spalte von dieser Migration, den Triggern und PUT /budget/:id/series;
+    // generateRecurringInstances() liest bei NULL das Datum des Ankers, also
+    // genau das Verhalten bis v228.
+    //
+    // GRID_FROM: ab welchem Tag das heutige Raster gilt. Eine Serien-Aenderung,
+    // die das Raster verschiebt (Starttag oder Rhythmus), raeumt nur ab heute
+    // ab; was davor liegt, ist gebucht und steht auf dem alten Raster. Der
+    // Monatsaufruf kennt das alte Raster nicht mehr und legte in einem schon
+    // gefuellten vergangenen Monat ein zweites Vorkommen daneben (Review-Befund
+    // in #1585). Vor grid_from erzeugt generateRecurringInstances() deshalb
+    // nichts. NULL = das Raster galt schon immer, keine Grenze - der Bestand
+    // bleibt, wie er ist.
+    //
+    // Idempotent: jede Spalte kommt nur dazu, wenn sie fehlt, und gefuellt
+    // wird nur, was noch keinen Starttag hat - ein zweiter Lauf ueberschreibt
+    // keinen inzwischen geaenderten.
+    up(db) {
+      const columns = db.prepare('PRAGMA table_info(budget_series)').all().map((c) => c.name);
+      if (!columns.includes('start_date')) {
+        db.exec('ALTER TABLE budget_series ADD COLUMN start_date TEXT');
+      }
+      if (!columns.includes('grid_from')) {
+        db.exec('ALTER TABLE budget_series ADD COLUMN grid_from TEXT');
+      }
+      // "Gibt es das Vorkommen an diesem Tag schon?" fragt occurrenceWriter()
+      // fuer jedes Vorkommen. Mit dem Index nur auf recurrence_parent_id las
+      // die Frage jede Buchung der Serie - beim Einfrieren der Vergangenheit
+      // vor einer Rasteraenderung (#1585) quadratisch: gemessen 290 s fuer
+      // eine Wochenserie ueber 100.000 Vorkommen. Ein kuenftiger Rebuild von
+      // budget_entries (wie v156) muss ihn mit anlegen.
+      db.exec('CREATE INDEX IF NOT EXISTS idx_budget_parent_date ON budget_entries(recurrence_parent_id, date)');
+      db.exec(`
+        UPDATE budget_series
+           SET start_date = (SELECT e.date FROM budget_entries e WHERE e.id = budget_series.anchor_id)
+         WHERE start_date IS NULL;
+
+        DROP TRIGGER IF EXISTS trg_budget_series_on_insert;
+        CREATE TRIGGER trg_budget_series_on_insert
+          AFTER INSERT ON budget_entries
+          WHEN NEW.is_recurring = 1 AND NEW.recurrence_parent_id IS NULL
+        BEGIN
+          INSERT OR IGNORE INTO budget_series
+            (anchor_id, title, amount, full_amount, category, subcategory, account_id, visibility,
+             start_date)
+          VALUES (NEW.id, NEW.title, NEW.amount, NEW.recurrence_full_amount, NEW.category,
+                  NEW.subcategory, NEW.account_id, NEW.visibility, NEW.date);
+        END;
+
+        DROP TRIGGER IF EXISTS trg_budget_series_on_start;
+        CREATE TRIGGER trg_budget_series_on_start
+          AFTER UPDATE OF is_recurring ON budget_entries
+          WHEN OLD.is_recurring = 0 AND NEW.is_recurring = 1 AND NEW.recurrence_parent_id IS NULL
+        BEGIN
+          INSERT OR IGNORE INTO budget_series
+            (anchor_id, title, amount, full_amount, category, subcategory, account_id, visibility,
+             start_date)
+          VALUES (NEW.id, NEW.title, NEW.amount, NEW.recurrence_full_amount, NEW.category,
+                  NEW.subcategory, NEW.account_id, NEW.visibility, NEW.date);
+        END;
+      `);
+    },
+  },
+  {
+    version: 230,
+    description: 'Rewards: reversal instead of deletion on reopen, series id on tasks and earnings (#1607, #1603)',
+    // DER LEDGER LÖSCHT NICHT MEHR (#1607). Bis hierher nahm das Wiederöffnen
+    // einer erledigten Aufgabe ihre earn-Zeile aus reward_ledger - entgegen dem
+    // Satz in v70, jede Zeile sei unveränderlich und nachvollziehbar. Ab jetzt
+    // bleibt die earn-Zeile stehen und die Rücknahme ist eine eigene Zeile
+    // (Typ 'reversal', negatives Delta, dieselbe task_id); der Satz aus v70
+    // stimmt damit erst seit dieser Migration.
+    //
+    // DAFÜR MUSS uniq_reward_earn FALLEN. Der partielle UNIQUE-Index
+    // (task_id, user_id) WHERE type = 'earn' ließ je Aufgabe und Person genau
+    // eine earn-Zeile zu. Bleibt die erste stehen, wäre das erneute Erledigen
+    // nach dem Wiederöffnen eine zweite - und der Index hätte sie abgewiesen:
+    // die Punkte wären nach einmal Hin und Her für immer weg. Die Idempotenz
+    // der Vergabe steht seitdem im Code, über den Netto-Stand der Aufgabe je
+    // Person (awardForCompletion in server/services/rewards.js).
+    //
+    // DER ERSATZINDEX IST NICHT EINDEUTIG und trägt genau diese Netto-Frage:
+    // sie liest je Statuswechsel die Buchungen einer Aufgabe, und ohne ihn
+    // wäre das ein Lauf über den ganzen Ledger. Ein künftiger Rebuild von
+    // reward_ledger muss ihn mit anlegen - und darf uniq_reward_earn NICHT
+    // wieder anlegen.
+    //
+    // KEIN BACKFILL: earn-Zeilen, die frühere Versionen beim Wiederöffnen
+    // gelöscht haben, sind weg, und aus dem Bestand lässt sich nicht ablesen,
+    // welche es gab. Die Salden bleiben, wie sie sind.
+    //
+    // DREI SPALTEN, DIE DAS LOESCHEN EINER AUFGABE UEBERLEBEN (#1603, #1607).
+    // reward_ledger.task_id und tasks.recurrence_origin_id sind beide ON DELETE
+    // SET NULL: wird eine erledigte Aufgabe geloescht, weiss die Gutschrift
+    // nicht mehr, wofuer sie war, und die Folgeinstanz nicht mehr, woher sie
+    // kommt. Alles, was ueber diese Verweise fragt, wird dann blind.
+    //   - tasks.recurrence_series_id: die ID des ERSTEN Vorkommens einer Serie,
+    //     beim Anlegen jeder Folgeinstanz (und jeder kopierten Teilaufgabe) als
+    //     Wert uebernommen. NULL = die Aufgabe ist selbst ein erstes Vorkommen,
+    //     oder sie stammt von vor dieser Migration (dann gilt die Wurzel der
+    //     Kette, seriesOfTask in server/services/rewards.js).
+    //   - reward_ledger.series_id: dieselbe Kennung an der Gutschrift. Der
+    //     Deckel "eine Gutschrift je Serie, Person und Haushaltstag" fragt den
+    //     Ledger direkt danach. NULL an Zeilen von vor dieser Migration und an
+    //     allem, was keine Gutschrift fuer eine Aufgabe ist.
+    //   - reward_ledger.reverses_id: an einer Gegenbuchung die ID der
+    //     Gutschrift, die sie zuruecknimmt.
+    // Keine Fremdschluessel: die Werte sollen gerade dann stehen bleiben, wenn
+    // das, worauf sie zeigen, verschwindet. Ein kuenftiger Rebuild von tasks
+    // oder reward_ledger muss die Spalten und ihre Indizes mitnehmen.
+    //
+    // KEIN BACKFILL DER KENNUNGEN: der Deckel ist neu, vor dieser Migration hat
+    // nichts gesperrt, also fehlt auch nichts. Offene Folgeinstanzen aus dem
+    // Bestand finden ihre Serie ueber die Kette und geben sie beim naechsten
+    // Abhaken als Wert weiter.
+    //
+    // Idempotent: Indizes ueber IF (NOT) EXISTS, Spalten nur, wenn sie fehlen.
+    up(db) {
+      db.exec(`
+        DROP INDEX IF EXISTS uniq_reward_earn;
+        CREATE INDEX IF NOT EXISTS idx_reward_ledger_task ON reward_ledger(task_id, user_id);
+      `);
+      const has = (table, column) => db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
+      if (!has('tasks', 'recurrence_series_id')) db.exec('ALTER TABLE tasks ADD COLUMN recurrence_series_id INTEGER');
+      if (!has('reward_ledger', 'series_id')) db.exec('ALTER TABLE reward_ledger ADD COLUMN series_id INTEGER');
+      if (!has('reward_ledger', 'reverses_id')) db.exec('ALTER TABLE reward_ledger ADD COLUMN reverses_id INTEGER');
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_reward_ledger_series ON reward_ledger(series_id, user_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_reward_ledger_reverses ON reward_ledger(reverses_id);
+      `);
+    },
+  },
 ];
 
 /**

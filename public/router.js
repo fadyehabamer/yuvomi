@@ -22,7 +22,8 @@ import { COMPOSITION_MODES } from '/utils/page-layout.js';
 import { init as initReminders, stop as stopReminders } from '/reminders.js';
 import { initPush, stopPush } from '/push.js';
 import { numberLocaleFor } from '/settings/region-presets.js';
-import { setDisplayTimeZone } from '/utils/timezone.js';
+import { setDisplayTimeZone, zonedDateKey } from '/utils/timezone.js';
+import { rememberZonePrefs, forgetZonePrefs, noteZoneDecision } from '/utils/household-zone-hint.js';
 import { isKitchenRoute, getLastKitchenRoute } from '/utils/kitchen-tabs.js';
 import { swapPage } from '/utils/view-transition.js';
 import { moduleAccentToken, moduleAccentVar } from '/utils/module-accent.js';
@@ -914,6 +915,10 @@ async function syncPreferencesOnce() {
     // der nichts darueber aussagt, wo dieser Haushalt lebt. Ohne getroffene
     // Wahl bleibt die Anzeige also beim Browser, so wie bisher.
     setDisplayTimeZone(res?.data?.timezone ?? null);
+    // Der Zonen-Hinweis der Uebersicht (#1607) liest genau diese Antwort: sie
+    // ist da, bevor die erste Seite zeichnet, also steht er schon neben dem
+    // Skelett und schiebt nichts nach.
+    rememberZonePrefs(res?.data);
     // Region als Formatier-Locale für Zahlen/Währung spiegeln (z. B. de-CH →
     // 123'456.78). getFormatLocale() in i18n.js liest diesen Wert.
     const numberLocale = numberLocaleFor({
@@ -3756,12 +3761,15 @@ function renderSearchResults(container, data, onClose, { local = { places: [], a
   // 3. DATEN - Reihenfolge, Ueberschrift, Ziel und Zweitzeile je Trefferart:
   // utils/search-sections.js (test:search-permissions prueft sie gegen die
   // Antwort des Servers).
-  const fmt = { formatDate, formatTime, activityLabel };
+  // `dateKey` ist der Kalendertag in der ANZEIGEZONE: der Termin-Treffer baut
+  // daraus den Tag seines Links (#1607), und ein synchronisierter Termin liegt
+  // als Instant in der Zeile - sein UTC-Tag waere der falsche.
+  const fmt = { formatDate, formatTime, activityLabel, dateKey: zonedDateKey };
   if (data) {
     SEARCH_SECTIONS.forEach((section) => {
       const hits = Array.isArray(data?.[section.bucket]) ? data[section.bucket] : [];
       makeSection(t(section.labelKey), section.module, hits, {
-        route: section.route,
+        route: (item) => section.route(item, fmt),
         title: (item) => (section.label ? section.label(item, fmt) : item.title),
         meta: section.meta ? (item) => section.meta(item, fmt) : null,
       });
@@ -4706,6 +4714,7 @@ window.addEventListener('popstate', (e) => {
 function forgetSessionState() {
   currentUser = null;
   _preferencesLoaded = false;
+  forgetZonePrefs();
   _hiddenModules = new Set();
   _moduleOrder = [];
   _mobileNavOrder = [];
@@ -4870,6 +4879,10 @@ window.addEventListener('date-format-changed', refreshCurrentRoute);
 // Die Anzeigezone wirkt auf jede Uhrzeit auf dem Schirm - dasselbe Neuzeichnen
 // wie beim Datums-/Zeitformat (#829 Teil 3).
 window.addEventListener('timezone-changed', refreshCurrentRoute);
+// Und der Zonen-Hinweis der Uebersicht erfaehrt hier, dass entschieden ist
+// (#1607): das Auswahlfeld der Einstellungen schreibt an ihm vorbei. Das
+// Neuzeichnen oben laeuft per setTimeout, liest also schon den neuen Stand.
+window.addEventListener('timezone-changed', (event) => noteZoneDecision(event.detail?.timezone));
 window.addEventListener('time-format-changed', refreshCurrentRoute);
 
 window.addEventListener('resize', () => {
@@ -5072,6 +5085,29 @@ window.yuvomi = {
   // Die Uebersichtsseite reicht ihre `/dashboard`-Antwort herein, statt sie ein
   // zweites Mal holen zu lassen. Begruendung an `primeModuleCountsFrom`.
   primeModuleCountsFrom,
+  // Fuer eine Seite, die sich SELBST neu aufbaut, ohne dass der Router
+  // navigiert - die Uebersicht beim Betreten und Verlassen des Wand-Modus, nach
+  // „erneut versuchen" oder einer Aenderung aus einer Kachel. renderPage()
+  // laeuft dann nicht, und mit ihm fehlten beide Haelften des FAB-Wechsels
+  // (#1588):
+  //   - clearPageFab(): der Knopf des vorigen Aufbaus haengt schon in der
+  //     Shell-Ebene neben dem Container. Bringt der neue Aufbau keinen mit (die
+  //     Wand), stand der alte bedienbar auf der Wand, bis die Seite ihn nach
+  //     ihren Daten selbst raeumte.
+  //   - adoptPageFab(): bringt er einen mit, blieb der im Scrollport - ohne
+  //     Glyph (die Icons zeichnet sonst erst updateNav()), und die Tab-Kapsel
+  //     hielt ihr hinteres Ende nicht mehr frei, weil ihre Reserve an
+  //     `.fab-layer .page-fab` haengt: die Slots liefen unter den Knopf.
+  // Aufzurufen direkt nach dem synchronen Teil von render(), wie in renderPage().
+  replacePageFab: () => {
+    clearPageFab();
+    const fab = adoptPageFab();
+    if (fab) {
+      markFabShortcut(fab);
+      window.lucide?.createIcons({ el: fab.closest('.page-fab-group') ?? fab });
+    }
+    return fab;
+  },
   applyTheme: (value) => {
     if (value === 'dark') {
       document.documentElement.setAttribute('data-theme', 'dark');

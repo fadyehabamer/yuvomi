@@ -49,6 +49,7 @@ import { widgetDisplayLabel, optionFieldLabel } from '/utils/extension-i18n.js';
 import { whoMark } from '/utils/seal-pair.js';
 import { MODULE_ICON, moduleIconHTML } from '/nav-icons.js';
 import { enterWallMode, exitWallMode, isWallActive, syncWallMode } from '/utils/wall-mode.js';
+import { mountZonePrompt } from '/utils/household-zone-hint.js';
 import { renderWallTimer, wireWallTimer } from '/components/wall-timer.js';
 import { rememberLayoutHint, layoutHintSizes, layoutHintQuery } from '/utils/dashboard-layout-hint.js';
 import { emptyHintHTML } from '/utils/empty-state.js';
@@ -2559,6 +2560,9 @@ function sizeSpans(size) {
 
 /** Der Satz zur naechsten Praemie - fuer Balken und Kennzahlkachel derselbe. */
 function rewardGoalLabel(balance, catalog, goal = nextRewardGoal(balance, catalog)) {
+  // Ein Minus steht nie ohne Satz da (#1607) - derselbe Satz und dieselbe
+  // Reihenfolge wie nextRewardHint() auf der Belohnungsseite.
+  if (Number(balance) < 0) return t('rewards.balanceBelowZero');
   if (!goal) return t('rewards.noRewardsYet');
   if (goal.reached) return t('rewards.canRedeemNow');
   return t('rewards.remainingToReward', { points: formatPoints(goal.missing), reward: goal.target.name });
@@ -6006,7 +6010,29 @@ export async function render(container, { user, signal: routeSignal = null } = {
     ${wallMode ? '' : renderFab()}
   `);
 
-  const rerender = () => render(container, { user, signal: routeSignal });
+  // Der Zonen-Hinweis fuer Bestandshaushalte (#1607): ein Admin, dessen Browser
+  // in einer anderen Zone steht, als der Haushalt ohne eigene Einstellung
+  // rechnet, wird hier einmal gefragt. HIER und nicht nach den Daten: der Stand
+  // dazu liegt seit dem Anmelden vor (router.js), die Zeile steht also schon
+  // neben dem Skelett. Sie haengt neben `.dashboard-shell`, nicht darin - die
+  // Shell wird mit den Daten neu gefuellt.
+  mountZonePrompt(container.querySelector('.dashboard'), {
+    user, t, api, wall: wallMode,
+    before: container.querySelector('#dashboard-shell'),
+    toast: (message, type) => window.yuvomi?.showToast(message, type),
+  });
+
+  // Ein Neuaufbau AUS DER SEITE HERAUS laeuft nicht durch renderPage() im
+  // Router, und damit an dessen FAB-Wechsel vorbei (#634): den alten Knopf aus
+  // der Shell-Ebene raeumen, den neuen aus dem Container dorthin heben. Der
+  // synchrone Teil von render() hat den Speed-Dial schon gelegt - oder, auf der
+  // Wand, keinen. Ohne diesen Schritt stand beim Betreten der alte Knopf auf der
+  // Wand und nach dem Verlassen der neue ohne Plus im Scrollport (#1588).
+  const rerender = () => {
+    const done = render(container, { user, signal: routeSignal });
+    window.yuvomi?.replacePageFab?.();
+    return done;
+  };
   // Steht keine Wand mehr (Ausstieg, Einstellungen), gehoert der Marker nicht
   // mehr ihr - sonst kostete die naechste Zurueck-Geste einen Tipp ins Leere.
   if (!wallMode) releaseWallMarker();
