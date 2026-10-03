@@ -4313,26 +4313,36 @@ test('Kalender in RTL: keine Regel in calendar.css haengt an einer physischen Se
   const where = (r) => `${r.selector.trim()}${r.at.length ? ` (in ${r.at.join(' ')})` : ''}`;
   const physical = /(?:^|[;\s])(?:margin|padding|border)-(?:left|right)\b|(?:^|[;\s])(?:left|right)\s*:|text-align:\s*(?:left|right)\b|border-(?:top|bottom)-(?:left|right)-radius|(?:^|[;\s])float\s*:\s*(?:left|right)/;
 
-  // Ausnahmen, jede mit Grund - und jede wird darauf geprueft, dass der
-  // Grund noch stimmt.
-  const symmetric = (body) => /(?:^|[;\s])left:\s*0\s*;/.test(body) && /(?:^|[;\s])right:\s*0\s*;/.test(body);
+  // Ausnahmen nennen die Deklarationen, die sie erlauben - nicht die ganze
+  // Regel. Genau diese fallen aus dem Rumpf, und der Rest muss frei von
+  // physischen Seiten sein: eine neue border-left in einer gelisteten Regel
+  // faellt so genauso auf wie in jeder anderen.
   const exceptions = {
     // links und rechts 0: die Linie spannt die ganze Spalte, in beiden Richtungen gleich
-    '.week-view__hour-line': symmetric,
-    '.week-view__now-line': symmetric,
+    '.week-view__hour-line': [/(?:^|[;\s])left:\s*0\s*;/, /(?:^|[;\s])right:\s*0\s*;/],
+    '.week-view__now-line': [/(?:^|[;\s])left:\s*0\s*;/, /(?:^|[;\s])right:\s*0\s*;/],
     // left: 50% mit translateX(-50%) zentriert, die Richtung spielt keine Rolle
-    '.day-view__empty-hint': (body) => /(?:^|[;\s])left:\s*50%/.test(body) && /translateX\(-50%\)/.test(body),
+    '.day-view__empty-hint': [/(?:^|[;\s])left:\s*50%\s*;/],
     // Ueberlappung im Avatar-Stapel: gehoert zur Folgearbeit an .avatar-stack
     // (user-multi-select.css, row-reverse mit margin-left) und kippt mit ihr
-    '.allday-event .avatar-stack__item, .week-event__time .avatar-stack__item': (body) => /margin-left:\s*calc\(-1 \* var\(--space-1\)\)/.test(body),
+    '.allday-event .avatar-stack__item, .week-event__time .avatar-stack__item': [
+      /(?:^|[;\s])margin-left:\s*calc\(-1 \* var\(--space-1\)\)\s*;/,
+    ],
   };
   for (const r of all) {
     if (!physical.test(r.body)) continue;
     const key = r.selector.trim().replace(/\s+/g, ' ');
-    const still = exceptions[key];
-    assert(still, `${where(r)} haengt an einer physischen Seite: ${r.body}`);
-    assert(still(r.body), `${where(r)} ist als Ausnahme gelistet, ihr Grund stimmt aber nicht mehr: ${r.body}`);
+    let rest = r.body;
+    for (const allowed of exceptions[key] ?? []) {
+      assert(allowed.test(rest), `${where(r)} ist als Ausnahme gelistet, ihr Grund stimmt aber nicht mehr: ${r.body}`);
+      rest = rest.replace(allowed, ';');
+    }
+    assert(!physical.test(rest), `${where(r)} haengt an einer physischen Seite: ${rest}`);
   }
+  // Die Zentrierung ist eine Bedingung, keine Seite: ohne translateX(-50%)
+  // stuende der Hinweis ab der Mitte nach rechts.
+  const hint = all.find((r) => r.at.length === 0 && r.selector.trim() === '.day-view__empty-hint');
+  assert(hint && /translateX\(-50%\)/.test(hint.body), '.day-view__empty-hint zentriert mit translateX(-50%)');
 
   // Die umgestellten Regeln tragen ihre logische Eigenschaft.
   const rule = (sel) => {
