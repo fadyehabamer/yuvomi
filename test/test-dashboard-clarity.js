@@ -110,6 +110,459 @@ test('Einkauf: Badge nennt alle offenen Artikel, weitere Listen werden genannt',
   assert.equal(badgeOf(__test.renderShoppingLists(lists)), '8', 'ohne Gesamtzahl: die geladenen Listen');
 });
 
+// Refs #1818: die Kachel zeigt die zuletzt geaenderte Liste zuerst, die
+// Einkaufsseite oeffnet ohne `?list=` die aelteste. Jede Zeile trug nur
+// `/shopping` - der Tipp auf "Drogerie" oeffnete den Wocheneinkauf. Gemessen
+// wird der ganze Weg: die gerenderte Zeile durch die echte Verdrahtung
+// (`wireLinks`), Klick und Tastatur, bis zu dem Pfad, den der Router bekommt.
+test('Einkauf: jede Listenzeile fuehrt zu IHRER Liste, per Klick und per Tastatur', () => {
+  const lists = [
+    { id: 7, name: 'Drogerie', open_count: 1, total_count: 1, items: [{ id: 70, name: 'Zahnpasta' }] },
+    { id: 3, name: 'Baumarkt & "Garten"', open_count: 2, total_count: 4, items: [{ id: 30, name: 'Duebel' }] },
+    { id: 1, name: 'Wocheneinkauf', open_count: 8, total_count: 10, items: [{ id: 10, name: 'Milch' }] },
+  ];
+  const html = __test.renderShoppingLists(lists, 23, 5);
+
+  // Die gerenderten Elemente mit `data-route`, in Dokumentreihenfolge, als das,
+  // was `querySelectorAll('[data-route]')` im Browser liefert.
+  const unesc = (v) => v.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  const elements = [...html.matchAll(/<([a-z]+)\b([^>]*\bdata-route="([^"]*)"[^>]*)>/g)].map((m) => {
+    const listeners = {};
+    return {
+      tagName: m[1].toUpperCase(),
+      id: '',
+      isListRow: /class="shopping-widget-list"/.test(m[2]),
+      attrs: m[2],
+      dataset: { route: unesc(m[3]) },
+      closest: () => null,
+      addEventListener: (type, fn) => { (listeners[type] ??= []).push(fn); },
+      fire: (type, event) => (listeners[type] ?? []).forEach((fn) => fn(event)),
+    };
+  });
+  const rows = elements.filter((el) => el.isListRow);
+  assert.equal(rows.length, 3, 'Reichweite: drei Listenzeilen stehen im Markup');
+  for (const row of rows) {
+    assert.match(row.attrs, /role="button"/, 'die Zeile bleibt per Tastatur erreichbar');
+    assert.match(row.attrs, /tabindex="0"/);
+  }
+
+  const visited = [];
+  const hadWindow = 'window' in globalThis;
+  const prevWindow = globalThis.window;
+  globalThis.window = { yuvomi: { navigate: (path) => { visited.push(path); } } };
+  try {
+    __test.wireLinks({ querySelectorAll: (sel) => (sel === '[data-route]' ? elements : []) }, () => {});
+    const key = (k) => ({ key: k, preventDefault() {}, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, button: 0 });
+    // JEDE GESTE WIRD AN IHREM EIGENEN SCHRITT GEMESSEN (#1821). Bis hierher
+    // las `target()` einfach den letzten Eintrag: eine Geste, die gar nicht
+    // navigierte, bestand ihre Zusicherung am Wert der Geste davor, und rot
+    // wurde erst die Summe am Ende - ohne zu sagen, WELCHE Geste fehlt.
+    const gesture = (label, fire) => {
+      const before = visited.length;
+      fire();
+      assert.equal(visited.length - before, 1, `${label}: navigiert genau einmal`);
+      // Was die Einkaufsseite aus der Adresse liest (shopping.js): `?list=`.
+      const url = new URL(visited.at(-1), 'http://yuvomi.test');
+      return [url.pathname, url.searchParams.get('list')];
+    };
+    rows.forEach((row, i) => {
+      const want = ['/shopping', String(lists[i].id)];
+      const name = `"${lists[i].name}"`;
+      assert.deepEqual(gesture(`Klick auf ${name}`, () => row.fire('click', key(''))), want, `Klick auf ${name}`);
+      assert.deepEqual(gesture(`Enter auf ${name}`, () => row.fire('keydown', key('Enter'))), want, `Enter auf ${name}`);
+      assert.deepEqual(gesture(`Leertaste auf ${name}`, () => row.fire('keydown', key(' '))), want, `Leertaste auf ${name}`);
+    });
+    assert.equal(visited.length, 9, 'jede Geste hat genau einmal navigiert');
+
+    // Der Kachelkopf zaehlt ueber alle Listen und bleibt ein Sammelverweis.
+    const header = elements.find((el) => /widget__link/.test(el.attrs));
+    assert.ok(header, 'Reichweite: der Kachelkopf ist verlinkt');
+    assert.equal(header.dataset.route, '/shopping');
+  } finally {
+    if (hadWindow) globalThis.window = prevWindow;
+    else delete globalThis.window;
+  }
+});
+
+// --------------------------------------------------------
+// #1821: eine Zeile, die EINEN Eintrag zeigt, fuehrt zu ihm
+// --------------------------------------------------------
+
+/** Die `data-route`-Ziele eines Markups, in Dokumentreihenfolge und entschluesselt. */
+function rowRoutesOf(html, className) {
+  const unesc = (v) => v.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  return [...html.matchAll(/<[a-z]+\b([^>]*\bdata-route="([^"]*)"[^>]*)>/g)]
+    .filter((m) => new RegExp(`class="${className}(?:["\\s])`).test(m[1]))
+    .map((m) => unesc(m[2]));
+}
+
+test('#1821 Notizen: jede Zeile fuehrt zu IHRER Notiz, der Kopf bleibt Sammelverweis', () => {
+  const notes = [{ id: 12, title: 'WLAN', content: 'a', pinned: 1 }, { id: 5, title: 'Schule', content: 'b', pinned: 0 }];
+  const html = __test.renderPinnedNotes(notes, '1x2', 2);
+  assert.deepEqual(rowRoutesOf(html, 'note-item'), ['/notes?open=12', '/notes?open=5']);
+  assert.deepEqual(rowRoutesOf(html, 'widget__link'), ['/notes']);
+});
+
+test('#1821 Geburtstage: jede Zeile fuehrt zu IHREM Anlass', () => {
+  const rows = [
+    { id: 4, name: 'Mike', next_birthday: '2026-11-02', days_until: 25, next_age: 41 },
+    { id: 9, name: 'Lena', next_birthday: '2026-11-09', days_until: 32, next_age: 8 },
+  ];
+  const html = renderUpcomingBirthdays(rows, '1x2', 2);
+  assert.deepEqual(rowRoutesOf(html, 'birthday-widget-item'), ['/birthdays?open=4', '/birthdays?open=9']);
+});
+
+test('#1821 Entsorgung: auch die Zeile OHNE naechsten Termin fuehrt zu ihrer Tonne', () => {
+  const html = __test.renderWasteWidget({
+    needsRefresh: false,
+    items: [
+      { type: { id: 3, name: 'Glas', sort_order: 1, color: null, icon: null }, next: null },
+      { type: { id: 8, name: 'Papier', sort_order: 0, color: null, icon: null },
+        next: { date_key: '2026-10-12', moved: false, coalesced: false, origins: [], deep_link: '?type=8&date=2026-10-12' } },
+    ],
+  }, '1x2');
+  // Die Seite liest `?type=` ohne Datum und hebt dann die Karte der Tonne hervor
+  // (parseDeepLinkParams / deepLinkSelectors in pages/waste.js).
+  assert.deepEqual(rowRoutesOf(html, 'waste-widget-row'), ['/waste?type=8&date=2026-10-12', '/waste?type=3']);
+});
+
+test('#1821 Einkauf im Heute-Blatt: eine einzige Liste mit Offenem ist das Ziel, mehrere sind die Seite', () => withSheet(() => {
+  const list = (id, open) => ({ id, name: `L${id}`, open_count: open, total_count: open, items: [] });
+  const one = { shoppingLists: [list(7, 4)], shoppingOpenCount: 4, shoppingOpenLists: 1 };
+  const two = { shoppingLists: [list(7, 4), list(2, 1)], shoppingOpenCount: 5, shoppingOpenLists: 2 };
+  assert.equal(__test.shoppingSoleListRoute(one), '/shopping?list=7');
+  assert.equal(__test.shoppingSoleListRoute(two), '/shopping');
+  // Der Server kappt bei drei Listen: vier offene Listen duerfen nicht auf die
+  // erste geladene zeigen, nur weil die Antwort sie zuerst nennt.
+  assert.equal(__test.shoppingSoleListRoute({ ...one, shoppingOpenLists: 4 }), '/shopping');
+  // Aelterer Server ohne Zaehler: lieber die Seite als eine geratene Liste.
+  assert.equal(__test.shoppingSoleListRoute({ shoppingLists: [list(7, 4)] }), '/shopping');
+  assert.equal(__test.shoppingSoleListRoute({}), '/shopping');
+
+  // Durch den echten Aufrufer: die Schlusszeile des Blatts.
+  const row = (data) => {
+    const model = __test.buildTodayCockpitModel(data, [], { cap: __test.PROGRAM_ROW_CAP, groupOverdue: false });
+    let found;
+    JSON.stringify(model, (_, value) => {
+      if (value && value.kind === 'shopping') found = value.route;
+      return value;
+    });
+    return found;
+  };
+  assert.equal(row(one), '/shopping?list=7', 'Schlusszeile, eine Liste');
+  assert.equal(row(two), '/shopping', 'Schlusszeile, zwei Listen');
+}));
+
+// --------------------------------------------------------
+// #1821: eine Zeile mit Query im Ziel waermt ihr Modul vor
+// --------------------------------------------------------
+
+test('#1821 Prefetch: die Query faellt auch von `data-route` ab', async () => {
+  const { prefetchPathOf } = await import('../public/utils/router-navigate.js');
+  // Bis #1821 fiel sie nur von `data-nav-href` ab: diese Ziele fanden keine Route.
+  assert.equal(prefetchPathOf({ route: '/shopping?list=7' }), '/shopping');
+  assert.equal(prefetchPathOf({ route: '/calendar?open=3&date=2026-10-08' }), '/calendar');
+  assert.equal(prefetchPathOf({ route: '/waste?type=2' }), '/waste');
+  assert.equal(prefetchPathOf({ route: '/tasks' }), '/tasks');
+  assert.equal(prefetchPathOf({ route: '/schedule/patterns' }), '/schedule/patterns');
+  // `data-nav-href` gewinnt, wie beim Klick der Navigation.
+  assert.equal(prefetchPathOf({ navHref: '/meals?week=1', route: '/kitchen' }), '/meals');
+  assert.equal(prefetchPathOf({ route: '/notes#x' }), '/notes');
+  assert.equal(prefetchPathOf({}), null);
+  assert.equal(prefetchPathOf(null), null);
+  assert.equal(prefetchPathOf({ route: '?x=1' }), null);
+
+  // Der Aufrufer: der Hover-/Press-Handler der Shell reicht genau das weiter.
+  const { readFileSync } = await import('node:fs');
+  const router = readFileSync(new URL('../public/router.js', import.meta.url), 'utf8');
+  const handler = router.slice(router.indexOf('const prefetchFromEvent = (e) => {'));
+  const body = handler.slice(0, handler.indexOf('};')).replace(/^\s*\/\/.*$/gm, '');
+  assert.match(body, /prefetchRoute\(prefetchPathOf\(el\.dataset\)\)/);
+  assert.doesNotMatch(body, /dataset\.route\)/, 'kein zweiter Weg mit der rohen Route');
+});
+
+test('#1821 Suche: ein Geburtstags-Treffer fuehrt zu SEINEM Anlass', async () => {
+  const { SEARCH_SECTIONS } = await import('../public/utils/search-sections.js');
+  const route = (bucket, item) => SEARCH_SECTIONS.find((s) => s.bucket === bucket).route(item, {});
+  assert.equal(route('birthdays', { id: 4 }), '/birthdays?open=4');
+  // Derselbe Parameter wie bei den Nachbarn mit Tiefenlink.
+  assert.equal(route('notes', { id: 4 }), '/notes?open=4');
+  assert.equal(route('contacts', { id: 4 }), '/contacts?open=4');
+});
+
+// --------------------------------------------------------
+// #1821: wohin der Router den Fokus nach einer Navigation legt
+// --------------------------------------------------------
+
+/** Die echte Funktion des Routers, mit einem Dokument, das nur den Fokus kennt. */
+async function navigateFocus({ path = '/', active, overlayOpen = false, inMain = [], atFrame = null }) {
+  const { focusMainAfterNavigation } = await import('../public/utils/router-navigate.js');
+  const frames = [];
+  const focused = [];
+  const doc = { activeElement: active };
+  const main = {
+    contains: (el) => el === main || inMain.includes(el),
+    focus(options) { focused.push(options); doc.activeElement = main; },
+  };
+  doc.getElementById = (id) => (id === 'main-content' ? main : null);
+  let overlay = overlayOpen;
+  focusMainAfterNavigation(path, {
+    document: doc,
+    requestAnimationFrame: (cb) => { frames.push(cb); },
+    hasOpenOverlay: () => overlay,
+  });
+  const queued = frames.length;
+  const focusedBeforeFrame = focused.length;
+  // Zwischen Aufbau und Frame: jemand tabbt in die Seite, die Seite oeffnet einen Dialog.
+  atFrame?.({ doc, main, openOverlay: () => { overlay = true; } });
+  frames.forEach((cb) => cb());
+  return { queued, focusedBeforeFrame, focused, activeIsMain: doc.activeElement === main, active: doc.activeElement };
+}
+
+test('#1821 Router-Fokus: nach einer Navigation aus Seitenleiste oder Tableiste bekommt <main> den Fokus', async () => {
+  // Der Zweck der Funktion - und der Rueckschritt, der mit den Ausnahmen unten
+  // nicht passieren darf: der Fokus bliebe auf dem Link, der die Seite oeffnete.
+  const navLink = { name: 'nav' };
+  const fromNav = await navigateFocus({ active: navLink });
+  assert.equal(fromNav.queued, 1, 'genau ein Frame');
+  assert.equal(fromNav.focusedBeforeFrame, 0, 'gefragt und fokussiert wird IM Frame, nicht davor');
+  assert.deepEqual(fromNav.focused, [{ preventScroll: true }]);
+  assert.equal(fromNav.activeIsMain, true);
+
+  // Die Zeile der ALTEN Seite ist mit ihr verschwunden: der Fokus liegt auf <body>.
+  const body = { name: 'body' };
+  assert.equal((await navigateFocus({ active: body })).activeIsMain, true);
+  assert.equal((await navigateFocus({ active: null })).activeIsMain, true);
+  // Ein Element ausserhalb von <main>, das kein Overlay ist (Suchfeld der Shell).
+  assert.equal((await navigateFocus({ active: { name: 'shell-search' } })).activeIsMain, true);
+});
+
+test('#1821 Router-Fokus: wer schon auf einer Zeile der neuen Seite steht, bleibt dort', async () => {
+  const row = { name: 'row' };
+  // Schon beim Aufruf dort ...
+  const there = await navigateFocus({ active: { name: 'nav' }, inMain: [row], atFrame: ({ doc }) => { doc.activeElement = row; } });
+  assert.deepEqual(there.focused, [], '<main> zieht den Fokus nicht von der Zeile ab');
+  assert.equal(there.active, row);
+  // ... und <main> selbst zaehlt nicht als "in der Seite".
+  const onMain = await navigateFocus({ active: null, atFrame: ({ doc, main }) => { doc.activeElement = main; } });
+  assert.equal(onMain.focused.length, 1);
+});
+
+test('#1821 Router-Fokus: ein Dialog, den die neue Seite oeffnet, behaelt den Fokus', async () => {
+  // `/notes?open=5` im verdeckten Tab: der Dialog nimmt den Fokus, der Frame
+  // des Routers ruht bis zum Zeigen des Tabs. Das Overlay liegt AUSSERHALB von
+  // <main> - `main.focus()` zoege den Fokus hinter den offenen Dialog.
+  const dialogButton = { name: 'dialog-close' };
+  const opened = await navigateFocus({
+    active: { name: 'nav' },
+    atFrame: ({ doc, openOverlay }) => { openOverlay(); doc.activeElement = dialogButton; },
+  });
+  assert.deepEqual(opened.focused, []);
+  assert.equal(opened.active, dialogButton);
+  // Auch wenn der Dialog den Fokus (noch) nicht hat: hinter ihn gehoert er nicht.
+  const pending = await navigateFocus({ active: { name: 'body' }, overlayOpen: true });
+  assert.deepEqual(pending.focused, []);
+});
+
+test('#1821 Router-Fokus: Anmeldung und Einrichtung bleiben unberuehrt, und der Router ruft genau diese Funktion', async () => {
+  assert.equal((await navigateFocus({ path: '/login', active: null })).queued, 0);
+  assert.equal((await navigateFocus({ path: '/setup', active: null })).queued, 0);
+
+  // router.js laesst sich nicht importieren; sein Anteil ist das Hereinreichen.
+  const { readFileSync } = await import('node:fs');
+  const router = readFileSync(new URL('../public/router.js', import.meta.url), 'utf8');
+  const fn = router.slice(router.indexOf('function focusMainContentAfterNavigation('));
+  const body = fn.slice(0, fn.indexOf('\n}\n') + 2).replace(/\s+/g, ' ');
+  assert.equal(body,
+    'function focusMainContentAfterNavigation(path) { focusMainAfterNavigation(path, { document, requestAnimationFrame: (cb) => requestAnimationFrame(cb), hasOpenOverlay, }); }',
+    'der Router fuegt keine eigene Bedingung hinzu - jede Regel steht in der gemessenen Funktion');
+  assert.match(router, /focusMainContentAfterNavigation, showToast, t,/, 'und reicht sie an navigate() weiter');
+});
+
+// --------------------------------------------------------
+// #1821: der Fokus auf einer Inhaltszeile ueberlebt den stillen Neuaufbau
+// --------------------------------------------------------
+
+/** Ein Element, wie `focusKeyOf` es liest - ohne DOM, mit benannten Vorfahren. */
+function fakeEl({ attrs = {}, classes = [], ancestors = {}, matches = [] } = {}) {
+  const el = {
+    id: attrs.id ?? '',
+    classList: classes,
+    dataset: Object.fromEntries(Object.entries(attrs)
+      .filter(([k]) => k.startsWith('data-'))
+      .map(([k, v]) => [k.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase()), v])),
+    hasAttribute: (name) => name in attrs,
+    getAttribute: (name) => attrs[name] ?? null,
+    ownerDocument: { querySelectorAll: () => matches },
+    closest(selector) {
+      for (const part of selector.split(',').map((x) => x.trim())) {
+        if (part in ancestors) return ancestors[part];
+        const own = /^\[([a-z-]+)\]$/.exec(part);
+        if (own && own[1] in attrs) return el;
+      }
+      return null;
+    },
+  };
+  return el;
+}
+
+test('#1821 Fokus: eine Zeile nennt sich ueber Ziel, Kachel und Stelle', () => {
+  const hadCss = 'CSS' in globalThis;
+  const prevCss = globalThis.CSS;
+  // Node kennt `CSS.escape` nicht; die Probe braucht nur, dass die Werte
+  // unveraendert im Selektor ankommen.
+  globalThis.CSS = { escape: (v) => String(v) };
+  try {
+    const shellOf = (matches) => ({ querySelectorAll: () => matches });
+    const tile = { dataset: { widgetId: 'shopping' } };
+
+    // Bis #1821 hatte eine Inhaltszeile KEINEN Schluessel: der stille Neuaufbau
+    // (Rueckkehr in den Tab, Viertelstundentakt) liess den Fokus auf <body>.
+    const row = fakeEl({ attrs: { 'data-route': '/shopping?list=7' } });
+    row.closest = ((orig) => (sel) => (sel === '.widget-wrapper[data-widget-id]' ? tile
+      : sel === '#dashboard-shell' ? shellOf([row]) : orig(sel)))(row.closest);
+    assert.deepEqual(__test.focusKeyOf(row), {
+      selector: '.widget-wrapper[data-widget-id="shopping"] [data-route="/shopping?list=7"]',
+      index: 0,
+      preventScroll: true,
+    });
+
+    // Mehrere Zeilen mit demselben Ziel (Schichtplan): die Stelle entscheidet.
+    const other = {};
+    const third = fakeEl({ attrs: { 'data-route': '/schedule/patterns' } });
+    third.closest = ((orig) => (sel) => (sel === '#dashboard-shell' ? shellOf([other, other, third]) : orig(sel)))(third.closest);
+    assert.equal(__test.focusKeyOf(third).index, 2);
+    assert.equal(__test.focusKeyOf(third).selector, '[data-route="/schedule/patterns"]');
+
+    // Der Tabstopp der Notizkarte ist ein KIND der Zeile.
+    const card = fakeEl({ attrs: { 'data-route': '/notes?open=5' } });
+    const body = fakeEl({ classes: ['note-item__body'], ancestors: { '[data-route]': card } });
+    assert.equal(__test.focusKeyOf(body).selector, '[data-route="/notes?open=5"] .note-item__body');
+    // Die Stelle zaehlt das KIND, nicht die Zeile: liegt der Fokus auf dem
+    // zweiten Treffer des Kind-Selektors, ist es der zweite - die Zeile selbst
+    // steht in dieser Trefferliste gar nicht.
+    const otherBody = {};
+    card.closest = ((orig) => (sel) => (sel === '#dashboard-shell' ? { querySelectorAll: () => [otherBody, body] } : orig(sel)))(card.closest);
+    assert.equal(__test.focusKeyOf(body).index, 1);
+
+    // Eine Aufgabenzeile fuehrt nirgendhin, sie oeffnet ein Objekt.
+    const task = fakeEl({ attrs: { 'data-task-id': '31' } });
+    assert.equal(__test.focusKeyOf(task).selector, '[data-task-id="31"]');
+
+    // Die Heute-Zeile einer Aufgabe: Ziel UND Objekt, sonst traefe `/tasks` die erste.
+    const cockpit = fakeEl({ attrs: { 'data-route': '/tasks', 'data-object-kind': 'task', 'data-object-id': '31' } });
+    assert.equal(__test.focusKeyOf(cockpit).selector, '[data-route="/tasks"][data-object-kind="task"][data-object-id="31"]');
+
+    // Was vorher galt, gilt weiter: Id zuerst, dann die Bearbeiten-Attribute.
+    assert.equal(__test.focusKeyOf(fakeEl({ attrs: { id: 'dashboard-customize-btn', 'data-route': '/x' } })), '#dashboard-customize-btn');
+    assert.equal(__test.focusKeyOf(fakeEl({ attrs: { 'data-widget-hide': 'notes' } })), '[data-widget-hide="notes"]');
+    // Und was keine Zeile ist, bekommt keinen Schluessel.
+    assert.equal(__test.focusKeyOf(fakeEl({ classes: ['widget__title'] })), null);
+  } finally {
+    if (hadCss) globalThis.CSS = prevCss; else delete globalThis.CSS;
+  }
+});
+
+/**
+ * Eine Flaeche fuer captureRebuildFocus/restoreFocusAfterRebuild: `nodes` sind
+ * die Elemente, die `selector` jeweils trifft - wie der Neuaufbau sie liefert.
+ */
+function fakeSurface(nodes) {
+  const log = [];
+  const make = (name, extra = {}) => ({ name, disabled: false, focus(options) { log.push([name, options]); }, ...extra });
+  const table = Object.fromEntries(Object.entries(nodes).map(([selector, list]) => [selector,
+    list.map((entry) => (typeof entry === 'string' ? make(entry) : make(entry.name, entry)))]));
+  return {
+    log,
+    table,
+    querySelector: (selector) => table[selector]?.[0] ?? null,
+    querySelectorAll: (selector) => table[selector] ?? [],
+  };
+}
+
+test('#1821 Fokus: der Neuaufbau gibt der Zeile den Fokus zurueck - an ihrer Stelle, ohne zu scrollen', () => {
+  const hadCss = 'CSS' in globalThis;
+  const prevCss = globalThis.CSS;
+  globalThis.CSS = { escape: (v) => String(v) };
+  try {
+    // VORHER: die dritte Schichtplan-Zeile hat den Fokus.
+    const body = {};
+    const rowsBefore = [{}, {}, null];
+    const row = fakeEl({ attrs: { 'data-route': '/schedule/patterns' } });
+    rowsBefore[2] = row;
+    const shellBefore = { contains: (el) => el === row, querySelectorAll: () => rowsBefore };
+    row.closest = ((orig) => (sel) => (sel === '#dashboard-shell' ? shellBefore : orig(sel)))(row.closest);
+    const before = __test.captureRebuildFocus(shellBefore, row, body);
+    assert.equal(before.had, true);
+    assert.deepEqual(before.key, { selector: '[data-route="/schedule/patterns"]', index: 2, preventScroll: true },
+      'die Erfassung gibt den Zeilenschluessel weiter');
+
+    // NACHHER: neue Elemente, derselbe Selektor. Die dritte bekommt den Fokus.
+    const after = fakeSurface({ '[data-route="/schedule/patterns"]': ['erste', 'zweite', 'dritte'] });
+    const got = __test.restoreFocusAfterRebuild(after, [before.key]);
+    assert.equal(got?.name, 'dritte');
+    assert.deepEqual(after.log, [['dritte', { preventScroll: true }]]);
+
+    // Die Zeile gibt es nach dem Neuaufbau nicht mehr (eine weniger): kein Fokus, kein Wurf.
+    const fewer = fakeSurface({ '[data-route="/schedule/patterns"]': ['erste', 'zweite'] });
+    assert.equal(__test.restoreFocusAfterRebuild(fewer, [before.key]), null);
+    assert.deepEqual(fewer.log, []);
+  } finally {
+    if (hadCss) globalThis.CSS = prevCss; else delete globalThis.CSS;
+  }
+});
+
+test('#1821 Fokus: ausserhalb der Flaeche oder auf <body> wird nichts erfasst', () => {
+  const body = {};
+  const outside = fakeEl({ attrs: { id: 'nav-link' } });
+  const shell = { contains: () => false };
+  assert.deepEqual(__test.captureRebuildFocus(shell, outside, body), { key: null, had: false });
+  assert.deepEqual(__test.captureRebuildFocus({ contains: () => true }, body, body), { key: null, had: false });
+  assert.deepEqual(__test.captureRebuildFocus({ contains: () => true }, null, body), { key: null, had: false });
+  // In der Flaeche, aber ohne Identitaet: Fokus war da, einen Schluessel gibt es nicht.
+  assert.deepEqual(__test.captureRebuildFocus({ contains: () => true }, fakeEl({ classes: ['widget__title'] }), body), { key: null, had: true });
+});
+
+test('#1821 Fokus: Selektor-Kandidaten des Anpassen-Modus gelten weiter - erster Treffer, mit Scrollen, in Reihenfolge', () => {
+  // Was vor #1821 galt: Ids und Bearbeiten-Knoepfe sind Selektoren. Ihr Fokus
+  // darf scrollen (die Geste hat ihn ausgeloest), und es gilt der ERSTE Treffer.
+  const surface = fakeSurface({
+    '#dashboard-customize-cancel': ['abbrechen'],
+    '#dashboard-customize-btn': ['anpassen'],
+    '[data-widget-hide="notes"]': ['ausblenden-a', 'ausblenden-b'],
+    '#gesperrt': [{ name: 'gesperrt', disabled: true }],
+  });
+  assert.equal(__test.restoreFocusAfterRebuild(surface, ['[data-widget-hide="notes"]', '#dashboard-customize-btn']).name, 'ausblenden-a');
+  assert.deepEqual(surface.log.at(-1), ['ausblenden-a', undefined], 'ohne preventScroll');
+  // Der erste Kandidat fehlt nach dem Aufbau: der naechste ist dran.
+  assert.equal(__test.restoreFocusAfterRebuild(surface, [null, '#gibt-es-nicht', '#dashboard-customize-cancel', '#dashboard-customize-btn']).name, 'abbrechen');
+  // Ein gesperrter Knopf wird uebersprungen.
+  assert.equal(__test.restoreFocusAfterRebuild(surface, ['#gesperrt', '#dashboard-customize-btn']).name, 'anpassen');
+  assert.equal(__test.restoreFocusAfterRebuild(surface, []), null);
+  assert.equal(__test.restoreFocusAfterRebuild(surface, null), null);
+  assert.equal(surface.log.length, 3);
+});
+
+test('#1821 Fokus: der Neuaufbau der Seite ruft Erfassen und Wiederfokus, um das setHtml herum', async () => {
+  // rebuildDashboard() lebt im Abschluss von render() und laesst sich nicht
+  // rufen. Was die beiden Funktionen TUN, messen die Tests darueber; hier steht
+  // nur, dass der Abschluss sie in dieser Reihenfolge und mit diesen Werten ruft.
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
+  const fn = src.slice(src.indexOf('  function rebuildDashboard(cfg) {'));
+  const body = fn.slice(0, fn.indexOf('\n  }\n')).split('\n').filter((line) => !/^\s*(\/\/|\/?\*)/.test(line)).join('\n');
+  const capture = body.indexOf('const { key: keepFocus, had: hadFocus } = captureRebuildFocus(shell, document.activeElement, document.body);');
+  const paint = body.indexOf('setHtml(shell, `\n      <section class="dashboard-masthead');
+  // R19: mobil steht der Anpassen-Einstieg im Menue (`.dashboard-tools-btn`) -
+  // der Knopf ist dort nicht gerendert, das Menue ist der Rueckweg.
+  // R20 (D, Wand-Modus): nach dem Verlassen der Wand steht danach der
+  // Einstieg in die Wand als letzter Kandidat - nach den drei oben.
+  const restore = body.search(/^ {4}restoreFocusAfterRebuild\(container, \[\n {6}keepFocus,\n {6}\.\.\.\(focusAfterRebuild \?\? \[\]\),\n {6}\.\.\.\(hadFocus && modeChanged \? \['#dashboard-customize-btn', '\.dashboard-tools-btn'\] : \[\]\),\n(?: {6}\.\.\.\(takeWallFocusIntent\('leave'\) \? \[[^\n]*\] : \[\]\),\n)? {4}\]\);$/m);
+  assert.ok(capture > 0, 'erfasst wird vor dem Aufbau');
+  assert.ok(paint > capture, 'dann wird gebaut');
+  assert.ok(restore > paint, 'und danach wieder fokussiert: eigener Schluessel, Nachfolger der Geste, Anpassen-Knopf');
+});
+
 test('der Aufrufer reicht die Gesamtzahlen aus der Antwort an die Kacheln durch', () => {
   // Der Renderer allein beweist nichts, wenn niemand ihm die Zahl gibt.
   const prevWindow = global.window;
@@ -777,4 +1230,232 @@ test('#1607: der Reiter aus der Kachel ist einer, den das Budget kennt', async (
   globalThis.localStorage = globalThis.localStorage ?? { getItem: () => null, setItem() {}, removeItem() {} };
   const { __test: budget } = await import('../public/pages/budget.js');
   assert.equal(budget.tabFromQuery('?tab=budget'), 'budget');
+});
+
+/* ZAHLEN TABELLARISCH (Critique R18, 2026-10-07). Gemessen trugen auf der
+ * Uebersicht 20 von 62 Textknoten mit Ziffern `tabular-nums`: der Budgetsaldo
+ * ja, die beiden Betraege darunter nicht; die Uhrzeit des Termins ja, die der
+ * Familienkarte nicht. Die Liste nennt die Traeger von Geld, Zeit und Zaehlern
+ * der Uebersicht; jeder muss von EINER tabular-Regel gedeckt sein (eigene
+ * Klasse im letzten Glied, `font-variant-numeric` erbt auf die Kinder) und im
+ * Markup der Uebersicht vorkommen - sonst prueft die Liste Luft. */
+test('R18: Geld, Zeit und Zaehler der Uebersicht stehen in tabular-nums', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { eachRule } = await import('./css-rules.js');
+  const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8');
+  const tabular = new Set();
+  for (const file of ['dashboard.css', 'panel.css', 'layout.css']) {
+    for (const rule of eachRule(read(`../public/styles/${file}`))) {
+      if (!/font-variant-numeric:\s*tabular-nums/.test(rule.body)) continue;
+      for (const part of rule.selector.split(',')) {
+        const last = part.trim().split(/[\s>+~]+/).pop();
+        for (const cls of last.match(/\.[\w-]+/g) ?? []) tabular.add(cls.slice(1));
+      }
+    }
+  }
+  const source = read('../public/pages/dashboard.js');
+  const carriers = [
+    'dashboard-overview__date', 'today-cockpit-card__value', 'today-cockpit-card__sub', 'today-cockpit__more',
+    'family-member__status', 'family-widget__footer', 'budget-widget__savings', 'budget-widget__flow-item',
+    'widget__badge', 'widget-list-more', 'birthday-widget-item__meta', 'birthday-widget-item__age',
+    'rewards-widget__footer', 'metric-card__value', 'metric-card__note',
+  ];
+  const missing = carriers.filter((cls) => !tabular.has(cls));
+  assert.deepEqual(missing, [], `Zahlentraeger ohne tabular-nums: ${missing.join(', ')}`);
+  const gone = carriers.filter((cls) => !source.includes(cls));
+  assert.deepEqual(gone, [], `nicht mehr im Markup der Uebersicht: ${gone.join(', ')}`);
+});
+
+/* VIER LESESTUFEN (Critique R18, 2026-10-07): 17 / 15 / 13 / 12 auf den
+ * Inhaltsflaechen der Uebersicht; 14 und 16 bleiben den Bedienelementen.
+ * Gemessen im Browser (1440, hell): 22 -> 16 Groesse/Gewicht-Paare, kein
+ * Inhalt der genannten Klassen mehr auf 14, 16 oder 18px; bei 390px in `fi`
+ * und `de` kein Umbruch und keine Ellipse an ihnen.
+ *
+ * Dieser Guard ist NICHT die Messung - die braucht ein Layout. Er haelt, was
+ * sich am Stylesheet halten laesst: die Klassen, die umgestellt wurden, stehen
+ * in JEDER ihrer Regeln auf einem Token der Leiter. */
+test('R18: die umgestellten Inhaltsklassen der Uebersicht stehen auf der Lese-Leiter (17/15/13/12)', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { eachRule } = await import('./css-rules.js');
+  const css = readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8');
+  const tokens = readFileSync(new URL('../public/styles/tokens.css', import.meta.url), 'utf8');
+  const LADDER = { '--type-card-title': '1.0625rem', '--type-secondary': '0.9375rem', '--type-caption': '0.8125rem', '--text-xs': '0.75rem' };
+  for (const [token, value] of Object.entries(LADDER)) {
+    assert.match(tokens, new RegExp(`${token}:\\s*${value.replace('.', '\\.')};`), `${token} ist ${value}`);
+  }
+  const expected = {
+    '.weather-widget__range': '--type-caption',
+    '.weather-widget__desc': '--type-caption',
+    '.weather-widget__city': '--type-caption',
+    '.budget-widget__savings span': '--type-caption',
+    '.budget-widget__savings strong': '--type-card-title',
+    '.budget-widget__flow-item > strong': '--type-caption',
+    '.birthday-widget-item__name': '--type-secondary',
+    '.birthday-widget-item__age': '--type-caption',
+    '.rewards-member__name': '--type-secondary',
+  };
+  const rules = [...eachRule(css)];
+  for (const [selector, token] of Object.entries(expected)) {
+    const sized = rules.filter((r) => r.selector.split(',').some((s) => s.trim() === selector) && /font-size:/.test(r.body));
+    assert.ok(sized.length >= 1, `${selector} nennt seine Groesse selbst (16px waeren sonst geerbt)`);
+    for (const rule of sized) {
+      const size = /font-size:\s*([^;]+);/.exec(rule.body)[1].trim();
+      assert.ok(Object.keys(LADDER).some((step) => size === `var(${step})`), `${selector} (${rule.at.join(' ') || 'Basis'}): ${size} liegt nicht auf der Leiter`);
+    }
+    assert.ok(sized.some((r) => r.at.length === 0 && new RegExp(`font-size:\\s*var\\(${token}\\)`).test(r.body)), `${selector}: Basis ${token}`);
+  }
+  // Kein Fett auf den Nebenwerten: semibold traegt die Zahl, bold bleibt Kennzahl und Avatar.
+  for (const selector of ['.budget-widget__savings strong', '.budget-widget__flow-item > strong', '.birthday-widget-item__age']) {
+    const body = rules.filter((r) => r.at.length === 0 && r.selector.split(',').some((s) => s.trim() === selector)).map((r) => r.body).join(';');
+    assert.match(body, /font-weight:\s*var\(--font-weight-semibold\)/, selector);
+  }
+});
+
+// Critique R19: das Onboarding nannte am Desktop einen "+-Knopf unten rechts".
+// Ab der Breite, ab der die Seitenleiste steht, dockt der Router den FAB als
+// Pille in den Modulkopf oben rechts (dockFabIntoToolbar/isDesktopViewport).
+// Die Desktop-Fassung beschreibt diesen Ort, in jeder Sprache, und beide Seiten
+// schalten an derselben Breite.
+test('Onboarding Schritt 3 nennt am Desktop den Knopf oben rechts, nicht unten (Critique R19)', async () => {
+  const { readFileSync, readdirSync } = await import('node:fs');
+  const dashboard = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
+  const router = readFileSync(new URL('../public/router.js', import.meta.url), 'utf8');
+  const steps = dashboard.slice(dashboard.indexOf('function getOnboardingSteps'), dashboard.indexOf('function showOnboarding'));
+  const onboardingBreak = /matchMedia\('\(min-width: (\d+)px\)'\)/.exec(steps)?.[1];
+  const dockBreak = /function isDesktopViewport\(\) \{\s*return window\.matchMedia\('\(min-width: (\d+)px\)'\)/.exec(router)?.[1];
+  assert.ok(onboardingBreak && dockBreak, 'Breakpoints nicht gefunden');
+  assert.equal(onboardingBreak, dockBreak, 'Onboarding und angedockter Knopf schalten an verschiedenen Breiten');
+  const bottom = { de: /unten/, en: /bottom/, fr: /\ben bas\b/, es: /inferior/, nl: /onder/, it: /in basso/ };
+  const top = { de: /oben rechts/, en: /top right/, fr: /en haut/, es: /arriba/, nl: /rechtsboven/, it: /in alto/ };
+  const dir = new URL('../public/locales/', import.meta.url);
+  for (const file of readdirSync(dir).filter((f) => f.endsWith('.json'))) {
+    const loc = file.slice(0, -5);
+    const text = JSON.parse(readFileSync(new URL(file, dir), 'utf8')).onboarding.step3BodyDesktop;
+    if (bottom[loc]) assert.doesNotMatch(text, bottom[loc], `${loc}: ${text}`);
+    if (top[loc]) assert.match(text, top[loc], `${loc}: ${text}`);
+  }
+});
+
+// Re-Critique 2026-10-17 (A1, Shell): der Rundgang war austauschbar - ein
+// Lucide-Haus statt der Bildmarke, und Leiste und Plus-Knopf nur beschrieben.
+// Schritt 1 traegt die Marke aus utils/brand-mark.js, Schritt 2 und 3 zeigen
+// per Lichtring auf das echte Bedienelement, das ihr Text nennt. Der Ring ist
+// Anzeige: das Overlay faengt weiter die Klicks, und die Tafel liegt ueber
+// seinem Abdunkler (positioniert), sonst stuende sie selbst im Grau.
+test('Onboarding: Bildmarke im ersten Schritt, Lichtring auf Leiste und Plus-Knopf (Re-Critique 2026-10-17)', async () => {
+  const { readFileSync } = await import('node:fs');
+  const dashboard = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
+  const css = readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8');
+  const steps = dashboard.slice(dashboard.indexOf('function getOnboardingSteps'), dashboard.indexOf('function showOnboarding'));
+  const show = dashboard.slice(dashboard.indexOf('function showOnboarding'), dashboard.indexOf('function maybeHintCustomize'));
+  assert.doesNotMatch(steps, /icon:\s*'home'/, 'kein generisches Haus als Zeichen des Produkts');
+  assert.match(dashboard, /import \{ brandMarkSvg \} from '\/utils\/brand-mark\.js'/);
+  assert.match(steps, /\{ mark: true,[^\n]*step1Title/, 'Schritt 1 traegt die Bildmarke');
+  assert.match(show, /brandMarkSvg\(\)/);
+  assert.match(steps, /step2Title[^\n]*\n\s*target: \(\) => document\.querySelector\(desktop \? '\.nav-sidebar' : '\.nav-bottom__items'\)/,
+    'Schritt 2 zeigt auf die Seitenleiste bzw. die Kapsel');
+  assert.match(steps, /step3Title[^\n]*\n\s*target: \(\) => \[\.\.\.document\.querySelectorAll\('\.page-fab'\)\]/,
+    'Schritt 3 zeigt auf den sichtbaren Plus-Knopf');
+  assert.match(show, /function placeSpotlight\(\)/);
+  assert.match(show, /classList\.toggle\('onboarding-overlay--spot', shown\)/, 'ohne sichtbares Ziel bleibt die Unschaerfe');
+  assert.match(show, /spot\.setAttribute\('aria-hidden', 'true'\)/);
+  assert.match(show, /removeEventListener\('resize', onResize\)/, 'der Ring haengt nach dem Rundgang an keinem Resize mehr');
+  const rule = (sel) => (css.match(new RegExp(`(?:^|\\n)${sel.replace(/[.]/g, '\\.')} \\{([^}]*)\\}`)) || [])[1] || '';
+  assert.match(rule('.onboarding-overlay--spot'), /backdrop-filter:\s*none/);
+  assert.match(rule('.onboarding-spotlight'), /pointer-events:\s*none/);
+  assert.match(rule('.onboarding-spotlight'), /box-shadow:[^;]*100vmax/);
+  assert.match(rule('.onboarding-card'), /position:\s*relative/, 'die Tafel liegt ueber dem Abdunkler');
+});
+
+// Re-Critique 2026-10-17 (A1): "Widgets anpassen" am Telefon trug je Zeile vier
+// umrandete 48px-Kreise. Hoch/Runter liegen jetzt in EINER Kapsel auf der
+// Mulde, Groesse und Ausblenden ohne Ring daneben; die Ziele bleiben 48px.
+test('Anpassen am Telefon: eine Kapsel fuer Hoch/Runter, keine Ringe je Knopf (Re-Critique 2026-10-17)', async () => {
+  const { readFileSync } = await import('node:fs');
+  const css = readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8');
+  const phone = css.slice(css.indexOf('ANPASSEN AUF DEM TELEFON IST EINE LISTE'));
+  const block = phone.slice(0, phone.indexOf('@media (max-width: 767px)'));
+  assert.match(block, /\.widget-edit-controls__hide,\s*\.widget-edit-controls__options,\s*\.widget-edit-controls__size-trigger\s*\) \{\s*border-color: transparent;\s*background: transparent;/,
+    'Groesse, Optionen und Ausblenden ohne Ring');
+  assert.match(block, /\.widget-edit-controls__move \{\s*gap: 0;\s*border-radius: var\(--radius-full\);\s*background: var\(--color-fill-well\);/,
+    'Hoch und Runter in einer Kapsel');
+  assert.match(block, /\.widget-edit-controls__move-btn \{\s*border: none;/);
+  // Die Zielgroesse kommt weiter aus der Fingerregel (48px).
+  assert.match(css, /@media \(pointer: coarse\)[\s\S]*?\.widget-edit-controls__move-btn \{\s*min-width: var\(--target-base\);\s*min-height: var\(--target-base\);/);
+});
+
+// --------------------------------------------------------
+// Critique R19 (layout): die Uebersicht steht auf derselben Inhaltsspalte wie
+// jedes Modul. Bis R19 war sie bis 1680px breit mit eigenem Polster; bei 1920
+// begann sie bei x 270, die Module bei x 430. Ein eigenes Hoechstmass oder ein
+// fester Seitenrand am Desktop liesse die Kante wieder springen.
+// --------------------------------------------------------
+test('die Uebersicht polstert am Desktop mit --page-inline-pad und kennt kein eigenes Hoechstmass', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { eachRule } = await import('./css-rules.js');
+  const css = readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8');
+  const root = [...eachRule(css)].filter((r) => r.selector.trim() === '.dashboard');
+  const desktop = root.filter((r) => r.at.some((a) => /min-width:\s*(\d+)px/.test(a) && Number(/min-width:\s*(\d+)px/.exec(a)[1]) >= 1024));
+  assert.ok(desktop.length >= 1, 'keine Desktop-Regel fuer .dashboard');
+  for (const rule of desktop) {
+    const pad = /padding(?:-inline)?:\s*([^;]+);/.exec(rule.body)?.[1] ?? '';
+    assert.match(pad, /var\(--page-inline-pad\)/, `${rule.at.join(' ')}: die Uebersicht polstert mit "${pad}" statt mit der Kante der Module`);
+  }
+  // Die zuletzt geltende Breite ohne At-Regel: kein festes Mass.
+  const widths = root.filter((r) => !r.at.length && /max-width:/.test(r.body)).map((r) => /max-width:\s*([^;]+);/.exec(r.body)[1].trim());
+  assert.equal(widths.at(-1), 'none', `die Uebersicht deckelt sich auf ${widths.at(-1)} - ihre Kante wiche von den Modulen ab`);
+});
+
+/* R19 (Entscheidung Ulas 2026-10-16, Critique P2 mobil): DIE UEBERSICHT AUF DEM
+ * TELEFON. Die Familie belegte 427px (51 % des Viewports) fuer fuenf Zeilen
+ * "1 Aufgabe", das Wetter begann bei y 1438, ueber dem Gruss standen drei
+ * Icon-Knoepfe. Jetzt: eine Avatar-Reihe mit Zaehler, die Wetterzeile im
+ * Masthead auch neben der Karte, der Wand-Modus im Anpassen-Menue. */
+test('R19 mobil: die Familie ist eine Avatar-Reihe mit Zaehler, Name und Satz bleiben im Baum', async () => {
+  const { readFileSync } = await import('node:fs');
+  const css = readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8');
+  const html = __test.renderFamilyWidget([ALEX, LEO, LINDA], { memberTodayTasks: [{ user_id: 1, open_count: 2 }] });
+  assert.match(html, /<span class="family-member__face">[\s\S]*?class="family-widget-avatar"[\s\S]*?<span class="family-member__count" aria-hidden="true">2<\/span>/,
+    'die Zahl offener Aufgaben steht als Marke am Gesicht');
+  assert.equal((html.match(/family-member__count/g) || []).length, 1, 'nur wer offene Aufgaben hat, traegt eine Marke');
+  assert.match(html, /<span class="family-member__short" aria-hidden="true">Alex<\/span>/, 'der Vorname unter dem Gesicht');
+  assert.match(html, /<span class="family-member__name">Alex<\/span>/, 'der volle Name bleibt der Name fuer Screenreader');
+  const phone = css.slice(css.indexOf('MOBIL IST DIE FAMILIE EINE AVATAR-REIHE'));
+  const block = phone.slice(phone.indexOf('@media (max-width: 639px) {'), phone.indexOf('\n}\n') + 2);
+  assert.match(block, /\.family-widget__list \{[^}]*flex-flow:\s*row wrap/, 'eine Reihe statt einer Liste');
+  assert.match(block, /\.family-member:not\(\.family-member--shared\) > \.family-member__body \{[^}]*clip-path:\s*inset\(50%\)/,
+    'Name und Satz geclippt, nicht entfernt');
+  assert.doesNotMatch(block, /\.family-member__body \{[^}]*display:\s*none/);
+  assert.match(block, /\.family-member--shared \{[^}]*order:\s*1;[^}]*flex:\s*1 0 100%/, 'der gemeinsame Termin als Zeile unter der Reihe');
+  assert.match(block, /\.family-widget__footer \{\s*display:\s*none/, 'die Tagesbilanz steht in den Marken');
+});
+
+test('R19 mobil: die Wetterzeile steht im Masthead auch neben der Karte, breit schliessen sich beide aus', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
+  const css = readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8');
+  assert.match(src, /renderDashboardOverview\(user, isCustomizing, weather, \{ followsDefault, canPublish, weatherCard: weatherCardShown \}\)/,
+    'das Wetter geht immer in den Kopf, die Karte nur als Merkmal');
+  const weather = { current: { temp: 18, desc: 'Sonnig', icon: '01d' }, units: 'metric' };
+  const head = __test.renderDashboardOverview({ display_name: 'Linda' }, false, weather, { weatherCard: true });
+  assert.match(head, /class="dashboard-overview__weather dashboard-overview__weather--card"/);
+  assert.match(css, /@media \(min-width: 768px\) \{\s*\.dashboard-overview__weather--card \{\s*display: none;/,
+    'ab 768px steht die Karte im Bild - dort nur sie');
+});
+
+test('R19 mobil: der Wand-Modus steht im Anpassen-Menue, je Breite ein Weg', async () => {
+  const { readFileSync } = await import('node:fs');
+  const css = readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8');
+  const src = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
+  const head = __test.renderDashboardOverview({ display_name: 'Linda' }, false, null, {});
+  assert.match(head, /class="btn btn--secondary btn--icon dashboard-icon-btn dashboard-tools-btn popover-menu__trigger"/);
+  assert.match(head, /data-action="dashboard-customize"[\s\S]*data-action="dashboard-wall"/, 'Anpassen und Wand-Modus als Eintraege');
+  assert.match(head, /id="dashboard-wall-enter"/, 'der Wand-Knopf bleibt im Baum - die Eintraege klicken ihn');
+  const display = __test.renderDashboardOverview({ display_name: 'Wand', access_scope: 'display' }, false, null, {});
+  assert.doesNotMatch(display, /dashboard-tools-btn/, 'ein Display hat kein Anpassen und damit kein Menue');
+  assert.match(css, /\.dashboard-tools-btn \{\s*display: none;\s*\}/, 'breit gibt es das Menue nicht');
+  assert.match(css, /@media \(max-width: 767px\) \{\s*\.dashboard-tools-btn \{\s*display: inline-flex;\s*\}\s*\.dashboard-overview__tools:has\(> \.dashboard-tools-btn\) > #dashboard-wall-enter,\s*\.dashboard-overview__tools:has\(> \.dashboard-tools-btn\) > #dashboard-customize-btn \{\s*display: none;/,
+    'schmal ersetzt das Menue die zwei Knoepfe');
+  assert.match(src, /if \(action === 'dashboard-wall'\) container\.querySelector\('#dashboard-wall-enter'\)\?\.click\(\);/);
 });

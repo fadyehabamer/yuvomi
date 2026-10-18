@@ -10,8 +10,9 @@ import { openModal, closeModal, confirmModal, confirmOverModal, advancedSection,
 import { makeSortable } from '/utils/sortable.js';
 import { memberRanks, memberRankOf } from '/utils/member-order.js';
 import { createPageFab, setPageFabAction } from '/utils/fab.js';
-import { emptyStateHTML } from '/utils/empty-state.js';
-import { rowActionHtml } from '/utils/row-action.js';
+import { emptyStateHTML, loadErrorHTML, mountLoadError } from '/utils/empty-state.js';
+import { rowActionHtml, rowMenuHtml } from '/utils/row-action.js';
+import { installPopoverMenus } from '/utils/popover-menu.js';
 import { wireScrollFade } from '/utils/ux.js';
 import { wireTablist } from '/utils/tablist.js';
 import { attachSegmentIndicator } from '/utils/segment-indicator.js';
@@ -32,6 +33,8 @@ let scheduleTablist = null;
 let currentUserId = null;
 let canManageOthers = false;
 let activeView = 'overview';
+// Der letzte Ladeversuch scheiterte: update() rendert dann ganz neu (render()).
+let loadFailed = false;
 // Der Vorgabewert oben gilt nur, bevor jemals entschieden wurde - render()
 // setzt ihn beim ALLERERSTEN Laden dieses Moduls (in dieser Sitzung) auf den
 // Startreiter "Vergleich" (R17, siehe dort), aber niemals danach: `activeView` ist ausdruecklich
@@ -189,6 +192,41 @@ const ALL_PRESETS = Object.freeze([...new Map(
 ).values()]);
 const SHIFT_COLOR_FALLBACK = USER_COLOR_DEFAULT;
 
+// DER KURZCODE SPRICHT DIE SPRACHE DES HAUSHALTS (R20, Re-Critique 2026-10-17
+// a3 P2-3). `shortCode` oben ist der englische Stand ("E", "L", "S"), und er
+// stand so in jeder Sprache: "S · Krank" neben "L · Spätschicht". Der Code
+// kommt jetzt aus `schedule.presetCodes.<key>` (in jeder Vorlage eindeutig,
+// test:schedule prueft das je Locale); Stunden heissen ueberall 1-4 und die
+// 24-Stunden-Schicht "24" - Ziffern brauchen keine Uebersetzung. Gespeichert
+// wird der Code beim Anlegen; bestehende Schichtarten behalten ihren.
+const NUMERIC_PRESET_CODES = Object.freeze({ period1: '1', period2: '2', period3: '3', period4: '4', fullDay: '24' });
+function presetShortCode(preset) {
+  if (NUMERIC_PRESET_CODES[preset.key]) return NUMERIC_PRESET_CODES[preset.key];
+  const key = `schedule.presetCodes.${preset.key}`;
+  const code = t(key);
+  return code && code !== key ? code : preset.shortCode;
+}
+
+/**
+ * Hat der Haushalt diese Vorlage schon? Ja bei ihrem Code von heute, dem
+ * englischen von frueher (vor R20 angelegt), ihrem Namen in der eigenen
+ * Sprache - ODER Symbol und Farbe der Vorlage. Code und Name allein reichen
+ * nicht, weil die Vorlage beide in der Sprache dessen anlegt, der getippt hat:
+ * eine deutsche "Frühschicht" mit Code F traf weder das englische E noch
+ * "Early shift", und "Arbeit" legte sie ein zweites Mal an (Codex-Review
+ * PR #2053, dasselbe Muster wie die Abfallvorlagen in pages/waste.js). Symbol
+ * und Farbe schreibt die Vorlage in jeder Sprache gleich, und kein Paar steht
+ * in zwei Vorlagen (test:schedule).
+ */
+function presetAlreadyThere(preset, types = state.types) {
+  const codes = new Set(types.map((type) => type.short_code));
+  const names = new Set(types.map((type) => String(type.name ?? '').trim().toLowerCase()));
+  const looks = new Set(types.map((type) => `${type.icon ?? ''}|${String(type.color ?? '').toUpperCase()}`));
+  return codes.has(presetShortCode(preset)) || codes.has(preset.shortCode)
+    || names.has(shiftPresetLabel(preset.key).trim().toLowerCase())
+    || looks.has(`${preset.icon}|${preset.color.toUpperCase()}`);
+}
+
 // Welche Vorlagen ueberhaupt als Knopf angeboten werden, ist selbst haushalt-
 // weit konfigurierbar (server/routes/preferences.js#schedule_hidden_templates,
 // Settings > Module > Optionen) - ein Haushalt, der nur Arbeit braucht, muss
@@ -259,9 +297,80 @@ const SCHEDULE_SERVER_ERROR_MESSAGES = {
   'Shift type is in use.': () => t('schedule.typeInUse'),
 };
 
+// Wo der Server einen `reason` mitgibt, zaehlt der und nicht der Wortlaut
+// (wie die Budget-Routen seit #1693/#1694): ein Satz mit mehreren Fehlern
+// ("from must be before to. user_id does not exist.") trifft keinen Eintrag
+// der Liste oben, sein reason schon.
+const SCHEDULE_SERVER_REASON_MESSAGES = {
+  range_reversed: () => t('schedule.rangeOrderError'),
+};
+
 function scheduleErrorMessage(error) {
+  const byReason = SCHEDULE_SERVER_REASON_MESSAGES[error?.data?.reason]?.();
+  if (byReason) return byReason;
   const raw = error?.data?.error ?? error?.message;
   return (raw && SCHEDULE_SERVER_ERROR_MESSAGES[raw]?.()) ?? raw ?? t('common.errorGeneric');
+}
+
+/* VON UND BIS EINES ZEITRAUMS (#1777).
+ *
+ * Drei Dialoge fragen einen Zeitraum ab: "Eintrag hinzufuegen" (range_from /
+ * range_to, fuer Abweichung UND Zusatzschicht dasselbe Feldpaar) und die
+ * beiden Bearbeiten-Dialoge (from / to). In keinem folgte "Bis", wenn "Von"
+ * daran vorbeizog: Von 08.10., Bis blieb 07.10., der Server sagte 400 und der
+ * Toast zeigte seinen englischen Satz.
+ *
+ * Zwei Haelften, beide noetig: (1) "Bis" zieht mit, sobald "Von" es ueberholt -
+ * das ist der haeufige Weg, und er hinterlaesst einen Einzeltag, den Normalfall
+ * dieser Dialoge. (2) Wer "Bis" danach selbst vor "Von" setzt, bekommt die
+ * Absage AM FELD, bevor etwas gesendet wird. Datumsschluessel (YYYY-MM-DD)
+ * vergleichen sich als Text richtig. */
+const RANGE_FIELD_PAIRS = [['range_from', 'range_to'], ['from', 'to']];
+
+function rangeFields(form) {
+  for (const [fromName, toName] of RANGE_FIELD_PAIRS) {
+    const from = form?.querySelector('[name="' + fromName + '"]');
+    const to = form?.querySelector('[name="' + toName + '"]');
+    if (from && to) return { from, to, fromName, toName };
+  }
+  return null;
+}
+
+const rangeReversed = (from, to) => Boolean(from && to && from > to);
+
+/**
+ * "Bis" folgt "Von". Der Datepicker meldet `change` an sich selbst.
+ *
+ * DIE MELDUNG AN "BIS" GEHT MIT. reportFieldError() raeumt sie erst ab, wenn
+ * "Bis" SELBST `input` oder `change` meldet. Wer den verkehrten Zeitraum
+ * ueber "Von" richtigstellt, fasst "Bis" nie an, und der Setter `to.value =`
+ * meldet nichts: Meldung und `aria-invalid="true"` blieben auf einem
+ * gueltigen Feld stehen. Deshalb meldet "Bis" hier `change`, sobald sich sein
+ * Wert durch das Mitziehen geaendert hat oder seine Meldung nicht mehr stimmt -
+ * dasselbe Ereignis, das der Datepicker nach einer Eingabe schickt.
+ */
+function wireRangeFollow(form) {
+  const fields = rangeFields(form);
+  if (!fields) return;
+  fields.from.addEventListener('change', () => {
+    const followed = rangeReversed(fields.from.value, fields.to.value);
+    if (followed) fields.to.value = fields.from.value;
+    const staleError = fields.to.getAttribute?.('aria-invalid') === 'true';
+    if (followed || staleError) fields.to.dispatchEvent?.(new Event('change', { bubbles: true }));
+  });
+}
+
+/**
+ * Die Pruefung des Dialogs vor dem Senden: true, wenn der Zeitraum verkehrt
+ * herum steht - dann traegt "Bis" die Meldung und nichts geht raus. Gelesen
+ * wird, was das Formular SENDEN wuerde (`data`): im Modus "Muster" ist das
+ * Feldpaar `disabled` und fehlt dort.
+ */
+function reportReversedRange(form, data) {
+  const fields = rangeFields(form);
+  if (!fields || !rangeReversed(data?.[fields.fromName], data?.[fields.toName])) return false;
+  reportFieldError(fields.to, t('schedule.rangeOrderError'));
+  return true;
 }
 
 async function load() {
@@ -640,8 +749,10 @@ async function activateView(view, { step = null } = {}) {
     try { await refreshOverview(); }
     catch (error) {
       if (requestId !== overviewRequestId) return; // eine juengere Anfrage entscheidet, nicht diese veraltete
-      overview = { ...overview, loading: false, error: true };
-      window.yuvomi?.showToast(scheduleErrorMessage(error), 'danger');
+      // Das Fehlerobjekt selbst, und KEIN Toast (Critique R19): der
+      // Fehlerzustand der Flaeche nennt die Ursache aus dem Fehler und bleibt
+      // stehen - ein Toast daneben sagte dasselbe ein zweites Mal.
+      overview = { ...overview, loading: false, error };
     }
     if (requestId === overviewRequestId) {
       if (hold) swapPeriod(bodyEl(), step, renderPage);
@@ -656,8 +767,7 @@ async function activateView(view, { step = null } = {}) {
   try { await refreshStatistics(); }
   catch (error) {
     if (requestId !== statisticsRequestId) return;
-    statistics = { ...statistics, loading: false, error: true };
-    window.yuvomi?.showToast(scheduleErrorMessage(error), 'danger');
+    statistics = { ...statistics, loading: false, error };
   }
   if (requestId === statisticsRequestId) renderPage();
 }
@@ -784,7 +894,7 @@ function applyShiftPreset(form) {
   const selected = ALL_PRESETS.find((preset) => preset.key === form.elements.shift_preset?.value);
   if (!selected) return;
   form.elements.name.value = shiftPresetLabel(selected.key);
-  form.elements.short_code.value = selected.shortCode;
+  form.elements.short_code.value = presetShortCode(selected);
   form.elements.start_time.value = selected.startTime;
   form.elements.end_time.value = selected.endTime;
   form.elements.color.value = selected.color;
@@ -872,7 +982,7 @@ async function pickShiftIcon(button) {
   const hidden = form?.elements?.icon;
   if (!hidden) return;
   const { openIconPicker } = await import('/components/icon-picker.js');
-  const chosen = await openIconPicker(hidden.value || null);
+  const chosen = await openIconPicker(hidden.value || null, { owner: button });
   if (chosen === undefined) return;
   hidden.value = chosen ?? '';
   setShiftIconButtonIcon(button, chosen);
@@ -907,6 +1017,53 @@ function patternFields(pattern = {}) {
  * Zusatzschichten darunter: Punkt, Symbol, Name, Uhrzeit, rechts "Bearbeiten"
  * und "Loeschen". Wer die Schichtart nicht aendern darf, liest in der
  * Metazeile, wem sie gehoert. */
+/**
+ * Bearbeiten und Loeschen einer Listenzeile als EIN Mehr-Knopf (Entscheidung
+ * 2026-10-07, utils/row-action.js). Hier standen je Zeile zwei Textkapseln,
+ * "Bearbeiten" und ein rot umrandetes "Loeschen" - fuenf Listen, in den
+ * Schichtarten sieben rote Rahmen untereinander, und unter 640px eine zweite
+ * Zeile nur fuer die zwei Knoepfe. Die Eintraege tragen dieselben
+ * data-Attribute wie die Knoepfe vorher; action() liest sie unveraendert.
+ */
+function editDeleteMenu({ key, name, edit, remove }) {
+  return '<span class="row-actions schedule-row-actions">' + rowMenuHtml({
+    id: `schedule-menu-${key}`,
+    label: t('common.moreActionsNamed', { name }),
+    items: [
+      { ...edit, icon: 'pencil', label: t('common.edit') },
+      { ...remove, icon: 'trash-2', label: t('schedule.delete'), danger: true },
+    ],
+  }) + '</span>';
+}
+
+/**
+ * SCHICHTARTEN NACH TAGESZEIT, GANZTAEGIGES FUER SICH (R20, Re-Critique
+ * 2026-10-17 a3 P3). Die Liste kam lexikalisch vom Server: "24 · 24-Stunden",
+ * "E · Fruehschicht", "S · Krank", "N · Nachtschicht", "LAB · Praktikum" -
+ * Urlaub zwischen Vorlesung und Tagschicht. Jetzt zwei Gruppen: mit Uhrzeit,
+ * nach Beginn sortiert (dann Name), und ganztaegig (Urlaub, Krank) nach Name.
+ * Pure, damit test:schedule die Ordnung ohne DOM prueft.
+ */
+function shiftTypeGroups(types = state.types) {
+  const byName = (a, b) => String(a.name ?? '').localeCompare(String(b.name ?? ''));
+  const timed = types.filter((type) => type.start_time && type.end_time)
+    .sort((a, b) => a.start_time.localeCompare(b.start_time) || byName(a, b));
+  const allDay = types.filter((type) => !(type.start_time && type.end_time)).sort(byName);
+  return [
+    { key: 'timed', label: t('schedule.typesWithTime'), types: timed },
+    { key: 'allDay', label: t('schedule.allDay'), types: allDay },
+  ].filter((group) => group.types.length);
+}
+
+function shiftTypeListHtml(types = state.types) {
+  const groups = shiftTypeGroups(types);
+  // Eine Gruppe allein braucht keinen Titel - die Liste heisst schon "Schichtarten".
+  if (groups.length === 1) return '<div class="row-carrier">' + groups[0].types.map(shiftTypeRow).join('') + '</div>';
+  return groups.map((group) => '<div class="schedule-type-group" data-type-group="' + group.key + '">'
+    + '<h3 class="schedule-type-group__title u-meta">' + esc(group.label) + '</h3>'
+    + '<div class="row-carrier">' + group.types.map(shiftTypeRow).join('') + '</div></div>').join('');
+}
+
 function shiftTypeRow(type) {
   const editable = canEditType(type);
   const icon = type.icon ? `<i data-lucide="${esc(type.icon)}" class="schedule-type-icon" aria-hidden="true"></i>` : '';
@@ -916,8 +1073,7 @@ function shiftTypeRow(type) {
     : t('schedule.typeOwnedBy', { user: userName(type.created_by) }));
   const meta = [clockLabel(type), owner].filter(Boolean).join(' · ');
   const actions = editable
-    ? '<span class="schedule-override-actions"><button type="button" class="btn btn--secondary" data-action="edit-shift-type" data-id="' + type.id + '" aria-label="' + esc(t('common.editNamed', { name })) + '">' + esc(t('common.edit')) + '</button>'
-      + '<button type="button" class="btn btn--danger-outline" data-action="delete-shift" data-id="' + type.id + '" aria-label="' + esc(t('common.deleteNamed', { name })) + '">' + esc(t('schedule.delete')) + '</button></span>'
+    ? editDeleteMenu({ key: `type-${type.id}`, name, edit: { action: 'edit-shift-type', id: type.id }, remove: { action: 'delete-shift', id: type.id } })
     : '';
   return `<div class="list-row schedule-type-row" data-shift-type="${type.id}"><span class="schedule-swatch" style="--schedule-color:${esc(type.color)}"></span>${icon}<div class="list-row__main"><span class="list-row__name">${esc(name)}</span><span class="list-row__meta">${esc(meta)}</span></div>${actions}</div>`;
 }
@@ -952,7 +1108,10 @@ function shiftTypeFieldsEditor(type) {
   // anhaengen, weil es nichts gab, wohin es haette zurueckkehren koennen.
   // syncTypeFieldPicker() fuehrt sie nach jedem Anhaengen und Entfernen nach.
   const picker = '<div class="schedule-type-field-add" data-field-add' + (available.length ? '' : ' hidden') + '>'
-      + '<select class="form-input" data-field-picker="' + type.id + '">' + available.map((field) => option(field.id, field.name)).join('') + '</select>'
+      // Kein sichtbares Label: die Abschnittsueberschrift steht direkt darueber.
+      // Ohne Namen sagt ein Screenreader nur "Kombinationsfeld" und den Namen
+      // des ersten Feldes als Wert (#1782).
+      + '<select class="form-input" data-field-picker="' + type.id + '" aria-label="' + esc(t('schedule.fieldPickerLabel')) + '">' + available.map((field) => option(field.id, field.name)).join('') + '</select>'
       + '<button type="button" class="btn btn--secondary" data-action="add-type-field" data-id="' + type.id + '">' + esc(t('common.add')) + '</button>'
       + '</div>';
   const body = '<div class="schedule-type-fields-rows" data-type-fields-rows="' + type.id + '">'
@@ -996,16 +1155,18 @@ function syncTypeFieldPicker(scope) {
 function customFieldRow(field) {
   const editable = canEditType(field);
   const actions = editable
-    ? '<span class="schedule-override-actions"><button type="button" class="btn btn--secondary" data-action="edit-custom-field" data-id="' + field.id + '">' + esc(t('common.edit')) + '</button>'
-      + '<button type="button" class="btn btn--danger-outline" data-action="delete-custom-field" data-id="' + field.id + '">' + esc(t('schedule.delete')) + '</button></span>'
+    ? editDeleteMenu({ key: `field-${field.id}`, name: field.name, edit: { action: 'edit-custom-field', id: field.id }, remove: { action: 'delete-custom-field', id: field.id } })
     : '';
   return '<div class="list-row schedule-custom-field-row"><div class="list-row__main"><span class="list-row__name">' + esc(field.name) + '</span></div>' + actions + '</div>';
 }
 
+// EIN VOLLER LEERZUSTAND JE SEITE (R18, 2026-10-07). "Eigene Felder" ist ein
+// Nebenabschnitt unter den Schichtarten: sein Kopf nennt den Kontext, also
+// traegt er die kompakte Form (ein Satz, der Anlege-Weg darunter) - nicht ein
+// zweites Zeichen mit zweiter Ueberschrift unter der Liste.
 function emptyCustomFieldsState() {
   return emptyStateHTML({
-    icon: 'list-plus',
-    title: t('schedule.emptyCustomFieldsTitle'),
+    compact: true,
     description: t('schedule.emptyCustomFieldsDescription'),
     actions: readOnly() ? [] : [{ label: t('schedule.createCustomField'), icon: 'plus', tone: 'secondary', attrs: { 'data-action': 'open-create-custom-field' } }],
   });
@@ -1102,9 +1263,8 @@ function patternRow(pattern) {
     : '';
   const meta = userName(pattern.user_id);
   const actions = writable
-    ? '<span class="schedule-override-actions"><button type="button" class="btn btn--secondary" data-action="edit-pattern" data-id="' + pattern.id + '" aria-label="' + esc(t('common.editNamed', { name: pattern.name })) + '">' + esc(t('common.edit')) + '</button>'
-      + '<button type="button" class="btn btn--danger-outline" data-action="delete-pattern" data-id="' + pattern.id + '" aria-label="' + esc(t('common.deleteNamed', { name: pattern.name })) + '">' + esc(t('schedule.delete')) + '</button></span>'
-    : '<span class="schedule-override-actions"><button type="button" class="btn btn--secondary" data-action="edit-pattern" data-id="' + pattern.id + '" aria-label="' + esc(t('common.showDetails')) + ': ' + esc(pattern.name) + '">' + esc(t('common.showDetails')) + '</button></span>';
+    ? editDeleteMenu({ key: `pattern-${pattern.id}`, name: pattern.name, edit: { action: 'edit-pattern', id: pattern.id }, remove: { action: 'delete-pattern', id: pattern.id } })
+    : '<span class="row-actions schedule-row-actions">' + rowActionHtml({ icon: 'eye', action: 'edit-pattern', label: t('common.showDetails') + ': ' + pattern.name, attrs: { 'data-id': pattern.id } }) + '</span>';
   return `<div class="list-row schedule-pattern-row" data-pattern-row="${pattern.id}"><div class="list-row__main"><span class="list-row__name">${esc(pattern.name)}${winsBadge}</span><span class="list-row__meta">${esc(meta)}</span></div>${actions}</div>`;
 }
 
@@ -1195,10 +1355,16 @@ function rangeDifference(oldFrom, oldTo, newFrom, newTo) {
 // Dieselbe Grammatik wie die Muster- und Schichtarten-Leerzustaende
 // (emptyStateHTML) statt eines blossen Absatzes - die drei Tabs derselben
 // Seite sollen sich wie ein Modul lesen, nicht wie drei verschiedene.
+//
+// KOMPAKT (R18, 2026-10-07): in der Planung standen drei volle Leerzustaende
+// untereinander (Schichtplaene, Ausnahmen, Zusatzschichten) - dreimal
+// dasselbe Zeichen, drei Ueberschriften unter drei Abschnittskoepfen. Der
+// volle gehoert dem Hauptabschnitt (emptyPatternState); Ausnahmen und
+// Zusatzschichten sind Nebenabschnitte und sagen es in einem Satz, mit ihrem
+// Anlege-Weg darunter.
 function emptyOverrideState() {
   return emptyStateHTML({
-    icon: 'calendar-clock',
-    title: t('schedule.emptyOverridesTitle'),
+    compact: true,
     description: t('schedule.emptyOverridesDescription'),
     action: readOnly() ? null : { label: t('schedule.createOverride'), icon: 'plus', tone: 'secondary', attrs: { 'data-action': 'open-create-override' } },
   });
@@ -1214,7 +1380,12 @@ function overrideRows() {
     const meta = [userName(group.user_id), typeLabel, group.note].filter(Boolean).join(' · ');
     const label = group.from === group.to ? formatDate(group.from) : `${formatDate(group.from)} - ${formatDate(group.to)}`;
     const actions = canWrite(group.user_id)
-      ? '<span class="schedule-override-actions"><button type="button" class="btn btn--secondary" data-action="edit-override" data-from="' + esc(group.from) + '" data-user-id="' + group.user_id + '">' + esc(t('common.edit')) + '</button><button type="button" class="btn btn--danger-outline" data-action="delete-override-range" data-from="' + esc(group.from) + '" data-to="' + esc(group.to) + '" data-user-id="' + group.user_id + '">' + esc(t('schedule.delete')) + '</button></span>'
+      ? editDeleteMenu({
+        key: `override-${group.user_id}-${group.from}`,
+        name: label,
+        edit: { action: 'edit-override', attrs: { 'data-from': group.from, 'data-user-id': group.user_id } },
+        remove: { action: 'delete-override-range', attrs: { 'data-from': group.from, 'data-to': group.to, 'data-user-id': group.user_id } },
+      })
       : '';
     const icon = type?.icon ? '<i data-lucide="' + esc(type.icon) + '" class="schedule-type-icon" aria-hidden="true"></i>' : '';
     return '<div class="list-row schedule-override"><span class="schedule-swatch" style="--schedule-color:' + esc(swatchColor) + '"></span>' + icon + '<div class="list-row__main"><span class="list-row__name">' + esc(label) + '</span><span class="list-row__meta">' + esc(meta) + '</span></div>' + actions + '</div>';
@@ -1232,8 +1403,7 @@ function extraBadge() {
 
 function emptyExtraShiftsState() {
   return emptyStateHTML({
-    icon: 'calendar-clock',
-    title: t('schedule.emptyExtraShiftsTitle'),
+    compact: true,
     description: t('schedule.emptyExtraShiftsDescription'),
     action: readOnly() ? null : { label: t('schedule.addExtraShift'), icon: 'plus', tone: 'secondary', attrs: { 'data-action': 'open-create-extra' } },
   });
@@ -1281,9 +1451,13 @@ function extraRows() {
     const meta = [userName(group.user_id), typeLabel, group.note].filter(Boolean).join(' · ');
     const label = group.from === group.to ? formatDate(group.from) : `${formatDate(group.from)} - ${formatDate(group.to)}`;
     const icon = type?.icon ? '<i data-lucide="' + esc(type.icon) + '" class="schedule-type-icon" aria-hidden="true"></i>' : '';
-    const ids = esc(group.ids.join(','));
     const actions = canWrite(group.user_id)
-      ? '<span class="schedule-override-actions"><button type="button" class="btn btn--secondary" data-action="edit-extra-range" data-ids="' + ids + '">' + esc(t('common.edit')) + '</button><button type="button" class="btn btn--danger-outline" data-action="delete-extra-range" data-ids="' + ids + '" data-user-id="' + group.user_id + '" data-from="' + esc(group.from) + '" data-to="' + esc(group.to) + '">' + esc(t('schedule.delete')) + '</button></span>'
+      ? editDeleteMenu({
+        key: `extra-${group.ids.join('-')}`,
+        name: label,
+        edit: { action: 'edit-extra-range', attrs: { 'data-ids': group.ids.join(',') } },
+        remove: { action: 'delete-extra-range', attrs: { 'data-ids': group.ids.join(','), 'data-user-id': group.user_id, 'data-from': group.from, 'data-to': group.to } },
+      })
       : '';
     return '<div class="list-row schedule-override"><span class="schedule-swatch" style="--schedule-color:' + esc(swatchColor) + '"></span>' + icon + extraBadge() + '<div class="list-row__main"><span class="list-row__name">' + esc(label) + '</span><span class="list-row__meta">' + esc(meta) + '</span></div>' + actions + '</div>';
   }).join('') + '</div>';
@@ -1306,6 +1480,17 @@ function setStatisticsRange(range) {
   statistics = { ...statistics, range, entries: [], bounds: null, loading: false, error: false };
   ++statisticsRequestId;
   renderPage();
+  applyStatistics();
+}
+
+/**
+ * KEIN ANWENDEN-KNOPF (R19, Critique 2026-10-16): wer Person oder Zeitraum
+ * wechselte, sah bis zum Tipp auf "Auswertung anzeigen" die alten oder gar
+ * keine Zahlen. Jede Aenderung im Filter rechnet jetzt sofort neu - ueber
+ * denselben Weg wie vorher das Absenden (submitForm, Generationszaehler).
+ */
+function applyStatistics() {
+  root?.querySelector('form[data-form="statistics"]')?.requestSubmit?.();
 }
 
 function renderStatistics() {
@@ -1342,12 +1527,19 @@ function renderStatistics() {
   // (laengst verschwundenen) Fehler-Toast bliebe der Nutzer bei einer stillen
   // Falschaussage. Eigener Zweig, denselben Fehlerzustand wie andere Module
   // (mountLoadError/emptyStateHTML variant:'error') statt erfundener Zahlen.
+  const printable = !statistics.loading && !statistics.error && Boolean(bounds) && statistics.entries.length > 0;
   const results = statistics.loading
     ? scheduleLoadingHtml({ rows: 3, lines: 2 })
     : statistics.error
-      ? emptyStateHTML({ variant: 'error', title: t('common.errorGeneric'), description: t('common.loadErrorDescription'), action: { label: t('common.retry'), icon: 'refresh-cw', attrs: { 'data-action': 'retry-statistics' } } })
+      ? loadErrorHTML({ title: t('common.errorGeneric'), error: statistics.error, attrs: { 'data-action': 'retry-statistics' } })
       : !bounds
       ? '<p class="card card--padded schedule-stat-empty" role="status">' + esc(t('schedule.invalidRange')) + '</p>'
+      : !statistics.entries.length
+      // LEER IST EIN ZUSTAND, KEINE ZWEI LEEREN KARTEN (R19): ohne einen
+      // Eintrag im Zeitraum standen "0 Schichten", "0 h" und zwei Karten mit
+      // "Keine Daten". Jetzt EIN Leerzustand, der Zeitraum und Person nennt.
+      ? '<p class="schedule-stat-period u-meta">' + esc(t('schedule.statisticsFor', { user: userName(selectedUser), from: formatDate(bounds.from), to: formatDate(bounds.to) })) + '</p>'
+        + emptyStateHTML({ icon: 'chart-column', title: t('schedule.noStatistics') })
       : '<p class="schedule-stat-period u-meta">' + esc(t('schedule.statisticsFor', { user: userName(selectedUser), from: formatDate(bounds.from), to: formatDate(bounds.to) })) + '</p>'
       + '<div class="metric-grid schedule-stat-metrics' + (overtime?.over ? ' schedule-stat-metrics--with-overtime' : '') + '">'
       + '<article class="metric-card"><div class="metric-card__label">' + esc(t('schedule.shiftCounts')) + '</div><div class="metric-card__value">' + esc(String(summary.totalCount)) + '</div><div class="metric-card__note">' + esc(t('schedule.shifts')) + '</div></article>'
@@ -1390,8 +1582,10 @@ function renderStatistics() {
     + '<select class="form-input schedule-stat-range__select" name="statistics_range" aria-label="' + esc(t('schedule.statisticsRange')) + '">'
     + STATISTICS_RANGES.map(([value, label]) => '<option value="' + value + '"' + (range === value ? ' selected' : '') + '>' + esc(t(label)) + '</option>').join('')
     + '</select></div>' + (controls ? '<div class="schedule-stat-dates">' + controls + '</div>' : '')
-    + '<div class="schedule-stat-filter-actions"><button class="btn btn--primary">' + esc(t('schedule.applyStatistics')) + '</button>'
-    + '<button type="button" class="btn btn--secondary" data-action="print-statistics"><i data-lucide="printer" aria-hidden="true"></i>' + esc(t('schedule.print')) + '</button></div></form>'
+    // DRUCKEN NUR, WO ES ETWAS ZU DRUCKEN GIBT (R20, Re-Critique 2026-10-17 a3):
+    // ueber dem Leerzustand druckte der Knopf eine leere Seite.
+    + (printable ? '<div class="schedule-stat-filter-actions">'
+    + '<button type="button" class="btn btn--secondary" data-action="print-statistics"><i data-lucide="printer" aria-hidden="true"></i>' + esc(t('schedule.print')) + '</button></div>' : '') + '</form>'
     + results + '</section>';
 }
 /**
@@ -1470,14 +1664,14 @@ function emptyShiftTypesState() {
     icon: 'calendar-clock',
     title: t('schedule.emptyShiftTypesTitle'),
     description: t('schedule.emptyShiftTypesDescription'),
-    // EIN PRIMAERKNOPF JE TAB (Re-Critique 2026-09-27, A2 P2): das ist der FAB
-    // mit seinem Nomen. Die Vorlagen und der Leerzustand-Weg sind Angebote
-    // daneben und tragen den Sekundaerton - vorher standen hier drei violette
-    // Knoepfe gleichzeitig (Kopf-FAB, "Arbeit", "Feld anlegen").
-    actions: readOnly() ? [] : [
-      ...visibleQuickstartTemplates().map(([key, labelKey]) => ({ label: t(labelKey), icon: 'sparkles', tone: 'secondary', attrs: { 'data-action': 'quick-start-shifts', 'data-template': key } })),
-      { label: t('schedule.createShiftType'), icon: 'plus', attrs: { 'data-action': 'open-create', 'data-view': 'shifts' } },
-    ],
+    // DER FAB IST DER EINE ANLEGE-WEG (Critique 2026-10-16, D5): „+ Schichtart"
+    // steht auf diesem Reiter immer da. Hier stand er ein zweites Mal als
+    // vierte gleichrangige Pille neben den drei Vorlagen; die Vorlagen bleiben
+    // als kleine Sekundaerknoepfe - ein Angebot neben dem Weg, kein zweiter.
+    actions: readOnly() ? [] : visibleQuickstartTemplates().map(([key, labelKey]) => ({
+      label: t(labelKey), icon: 'sparkles', tone: 'secondary', className: 'btn--sm',
+      attrs: { 'data-action': 'quick-start-shifts', 'data-template': key },
+    })),
   });
 }
 
@@ -1797,7 +1991,9 @@ function renderOverview() {
   // derselbe wie auf "Schichtarten" (Vorlagen + "Schichtart hinzufuegen") bzw.
   // wie auf "Planung" ("Schichtplan hinzufuegen"). Nach dem Speichern steht
   // man weiter hier (reloadAfterWrite()) und sieht den naechsten Schritt.
-  if (planningNeedsShiftTypes()) return `<section class="schedule-overview schedule-overview--start">${emptyShiftTypesState()}</section>`;
+  // Der Vergleich ist eine Leseansicht ohne FAB: ohne Schichtart fuehrt EIN
+  // Weg dorthin, wo sie entsteht - derselbe Leerzustand wie in der Planung.
+  if (planningNeedsShiftTypes()) return `<section class="schedule-overview schedule-overview--start">${emptyPlanningNeedsTypesState()}</section>`;
   if (!state.patterns.length && !state.overrides.length && !state.extras.length && !overview.loading && !overview.error && !overview.entries.length) {
     return `<section class="schedule-overview schedule-overview--start">${emptyPatternState()}</section>`;
   }
@@ -1846,7 +2042,7 @@ function renderOverview() {
     return `<section class="schedule-overview">${header}${scheduleLoadingHtml({ rows: Math.max(2, overview.selectedIds.length), lines: 1 })}</section>`;
   }
   if (overview.error) {
-    return `<section class="schedule-overview">${header}${emptyStateHTML({ variant: 'error', title: t('common.errorGeneric'), description: t('common.loadErrorDescription'), action: { label: t('common.retry'), icon: 'refresh-cw', attrs: { 'data-action': 'retry-overview' } } })}</section>`;
+    return `<section class="schedule-overview">${header}${loadErrorHTML({ title: t('common.errorGeneric'), error: overview.error, attrs: { 'data-action': 'retry-overview' } })}</section>`;
   }
 
   if (!overview.selectedIds.length) {
@@ -1925,7 +2121,12 @@ function navigateToView(id) {
  * `.page-toolbar__actions` survives every subsequent tab change instead of
  * being destroyed along with a full-page reset.
  */
-function renderShell() {
+/**
+ * Kopf der Seite: Titel und Reiter. Unter 1024px SIND die Reiter der Titel
+ * (`.page-toolbar--tabs-title`, das h1 tritt zurueck) - deshalb baut auch der
+ * Ladefehler in render() diesen Kopf, statt die Seite ohne ihn zu zeigen.
+ */
+function scheduleHeadHtml(current = activeView) {
   // DER PLAN ZUERST (Entscheidung R17, E1). "Vergleich" - die Woche als Raster -
   // ist das, wofuer jemand den Schichtplan oeffnet; bis R17 stand er als
   // letzter Reiter hinter drei Reitern Stammdaten und verlangte dort erst eine
@@ -1936,15 +2137,19 @@ function renderShell() {
     ['patterns', t('schedule.planning')],
     ['statistics', t('schedule.statistics')],
   ];
-  root.replaceChildren();
-  root.insertAdjacentHTML('beforeend', `<div class="schedule-page app-page app-page--full" data-composition="full">
-    <header class="page-toolbar schedule-toolbar">
+  return `<header class="page-toolbar page-toolbar--tabs-title schedule-toolbar">
       <h1 class="page-toolbar__title">${esc(t('schedule.title'))}</h1>
       <div class="page-toolbar__actions"></div>
       <div class="sub-tabs-bar schedule-tabs page-toolbar__bar" role="tablist" aria-label="${esc(t('schedule.title'))}">
-        ${tabs.map(([id, label]) => `<button class="sub-tab${id === activeView ? ' sub-tab--active' : ''}" id="schedule-tab-${id}" type="button" role="tab" data-tab-id="${id}" aria-controls="schedule-body" aria-selected="${id === activeView ? 'true' : 'false'}" tabindex="${id === activeView ? '0' : '-1'}">${esc(label)}</button>`).join('')}
+        ${tabs.map(([id, label]) => `<button class="sub-tab${id === current ? ' sub-tab--active' : ''}" id="schedule-tab-${id}" type="button" role="tab" data-tab-id="${id}" aria-controls="schedule-body" aria-selected="${id === current ? 'true' : 'false'}" tabindex="${id === current ? '0' : '-1'}">${esc(label)}</button>`).join('')}
       </div>
-    </header>
+    </header>`;
+}
+
+function renderShell() {
+  root.replaceChildren();
+  root.insertAdjacentHTML('beforeend', `<div class="schedule-page app-page app-page--full" data-composition="full">
+    ${scheduleHeadHtml()}
     <div class="schedule-today-slot"></div>
     <div class="schedule-body" id="schedule-body" role="tabpanel" tabindex="0"></div>
   </div>`);
@@ -1971,6 +2176,8 @@ function renderShell() {
   // Leiste wird hier EINMAL gebaut; die Kapsel folgt sync()/Klick selbst.
   attachSegmentIndicator(root.querySelector('.schedule-tabs'));
   root.addEventListener('submit', submitForm);
+  // Die Mehr-Knoepfe der Listenzeilen (editDeleteMenu) - idempotent.
+  installPopoverMenus(root);
   root.addEventListener('click', (event) => {
     const actionButton = event.target.closest('[data-action]');
     if (actionButton) action({ currentTarget: actionButton });
@@ -1979,6 +2186,9 @@ function renderShell() {
     if (event.target.matches('.schedule-stat-range__select')) {
       // Das schmale Gegenstueck zum Segment (R9 M11) - derselbe Wechsel.
       setStatisticsRange(event.target.value);
+    } else if (event.target.closest('form[data-form="statistics"]')) {
+      // Person, Monate oder Tage: sofort neu rechnen (applyStatistics).
+      applyStatistics();
     } else if (event.target.closest('[data-ms-input="overview-people"]')) {
       // Auswahl ist rein clientseitig - kein Fetch, nur eine Neuzeichnung
       // (siehe Kommentar an overview weiter oben).
@@ -2055,10 +2265,19 @@ function renderPage() {
       // Buttons wie in emptyShiftTypesState() (derselbe Sparkles-Weg im
       // Leerzustand) statt des Umschalter-Aussehens; die Haushalts-Vorlagen-
       // Filterung (visibleQuickstartTemplates()) bleibt unveraendert.
-      + (locked ? '' : (state.types.length && visibleQuickstartTemplates().length ? '<div class="schedule-quickstart-actions" role="group" aria-label="' + esc(t('schedule.quickStartShiftTypes')) + '">'
-        + visibleQuickstartTemplates().map(([template, key]) => '<button type="button" class="btn btn--secondary btn--sm" data-action="quick-start-shifts" data-template="' + template + '"><i data-lucide="sparkles" aria-hidden="true"></i>' + esc(t(key)) + '</button>').join('')
-        + '</div>' : '')) + '</div>'
-      + (state.types.length ? '<div class="row-carrier">' + state.types.map(shiftTypeRow).join('') + '</div>' : emptyShiftTypesState()) + '</section>'
+      //
+      // R20 (Re-Critique 2026-10-17 a3 P3): DER SCHNELLSTART STEHT UNTER DER
+      // LISTE, NICHT IM KOPF. Neben dem Titel waren die drei Knoepfe das
+      // Lauteste der Seite, auch wenn der Haushalt laengst seine Schichtarten
+      // hat. Im Leerzustand bleiben sie die Hauptaktion; danach stehen sie als
+      // leise Zeile "Schnellstart: Arbeit · Schule · Universitaet" am Ende -
+      // erreichbar fuer die zweite Vorlage, ohne den Blick zu ziehen.
+      + '</div>'
+      + (state.types.length ? shiftTypeListHtml() : emptyShiftTypesState())
+      + (locked ? '' : (state.types.length && visibleQuickstartTemplates().length ? '<div class="schedule-quickstart-actions schedule-quickstart-actions--more" role="group" aria-labelledby="schedule-quickstart-label">'
+        + '<span class="u-meta" id="schedule-quickstart-label">' + esc(t('schedule.quickStartShiftTypes')) + '</span>'
+        + visibleQuickstartTemplates().map(([template, key]) => '<button type="button" class="btn btn--ghost btn--sm" data-action="quick-start-shifts" data-template="' + template + '"><i data-lucide="sparkles" aria-hidden="true"></i>' + esc(t(key)) + '</button>').join('')
+        + '</div>' : '')) + '</section>'
       + customFieldsSection()
     : activeView === 'patterns'
       ? planningPanel()
@@ -2197,6 +2416,7 @@ function openOverrideEditModal(group) {
     onSave: (modal) => {
       const form = modal.querySelector('#schedule-create-form');
       wireOccurrenceFieldReactivity(form);
+      wireRangeFollow(form);
       form?.addEventListener('submit', saveCreatedSchedule);
     },
   });
@@ -2258,6 +2478,7 @@ function openExtraGroupEditModal(group) {
         form.querySelector('[name="reminder_offset_minutes"]').disabled = !event.currentTarget.checked;
       });
       wireOccurrenceFieldReactivity(form);
+      wireRangeFollow(form);
       form?.addEventListener('submit', saveCreatedSchedule);
     },
   });
@@ -2401,6 +2622,7 @@ function openScheduleCreateModal(view, { mode = 'pattern' } = {}) {
         form.querySelector('[name="reminder_offset_minutes"]').disabled = !event.currentTarget.checked;
       });
       wireOccurrenceFieldReactivity(form);
+      wireRangeFollow(form);
       form?.addEventListener('submit', saveCreatedSchedule);
     },
   });
@@ -2425,6 +2647,7 @@ async function saveCreatedSchedule(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const data = formData(form);
+  if (reportReversedRange(form, data)) return;
   try {
     if (form.dataset.form === 'shift-create') await api.post('/schedule/shift-types', data);
     if (form.dataset.form === 'pattern-create') {
@@ -2941,9 +3164,14 @@ async function submitForm(event) {
     // (saveCreatedSchedule(), saveShiftTypeEdit(), savePatternEdit()). Dieser
     // Delegierte an `root` sieht nur noch den Filter der Auswertung.
   } catch (error) {
-    if (form.dataset.form === 'statistics' && statisticsRequest === statisticsRequestId) {
-      statistics = { ...statistics, loading: false, error: true };
-      renderPage();
+    if (form.dataset.form === 'statistics') {
+      // Die Flaeche zeigt den Fehler selbst - kein Toast daneben (Critique R19).
+      // Eine ueberholte Anfrage schweigt: die juengere entscheidet.
+      if (statisticsRequest === statisticsRequestId) {
+        statistics = { ...statistics, loading: false, error };
+        renderPage();
+      }
+      return;
     }
     window.yuvomi?.showToast(scheduleErrorMessage(error), 'danger');
   }
@@ -2999,14 +3227,16 @@ async function action(event) {
     if (button.dataset.action === 'quick-start-shifts') {
       button.disabled = true;
       const template = PRESET_TEMPLATES[button.dataset.template] ?? [];
-      const existingCodes = new Set(state.types.map((type) => type.short_code));
+      const existing = [...state.types];
       let createdCount = 0;
       try {
         for (const preset of template) {
-          if (existingCodes.has(preset.shortCode)) continue;
+          // Schon da: presetAlreadyThere() - Code, Name oder Symbol und Farbe.
+          if (presetAlreadyThere(preset, existing)) continue;
+          const code = presetShortCode(preset);
           await api.post('/schedule/shift-types', {
             name: shiftPresetLabel(preset.key),
-            short_code: preset.shortCode,
+            short_code: code,
             start_time: preset.startTime,
             end_time: preset.endTime,
             color: preset.color,
@@ -3020,7 +3250,7 @@ async function action(event) {
       }
       // Zaehlend statt "Gespeichert." fuer beide Faelle (S-11): ein erneuter
       // Klick auf dieselbe Vorlage legt nichts mehr an (siehe Kommentar oben,
-      // existingCodes ueberspringt jeden schon vorhandenen Kurzcode) - das war
+      // presetAlreadyThere() ueberspringt jede schon vorhandene Vorlage) - das war
       // vorher nicht vom Erfolgsfall zu unterscheiden.
       window.yuvomi?.showToast(
         createdCount > 0 ? t('schedule.quickStartCreated', { count: createdCount }) : t('schedule.quickStartNothingNew'),
@@ -3220,8 +3450,8 @@ async function reloadAfterWrite() {
   if (activeView !== 'overview') return;
   const requestId = ++overviewRequestId;
   try { await refreshOverview(); }
-  catch {
-    if (requestId === overviewRequestId) overview = { ...overview, loading: false, error: true };
+  catch (error) {
+    if (requestId === overviewRequestId) overview = { ...overview, loading: false, error };
   }
 }
 
@@ -3229,7 +3459,46 @@ export async function render(container, { user } = {}) {
   root = container;
   currentUserId = user?.id ?? null;
   canManageOthers = user?.role === 'admin';
-  await load();
+  // EIN LADEFEHLER IST EIN ZUSTAND DER SEITE (R19, Critique 2026-10-16).
+  // load() warf bis hierher durch render() in den Fehlerbildschirm des
+  // Routers - unter 429 (Rate-Limit hinter einem Proxy) stand der Schichtplan
+  // als "Seite konnte nicht geladen werden" da. Jetzt zeigt die Seite selbst
+  // den geteilten Ladefehler (Ursache aus dem Fehler, Status in den Details)
+  // mit "Erneut versuchen", wie Haushaltshilfe und Abos.
+  //
+  // DER KOPF BLEIBT STEHEN (Re-Kritik 2026-10-17): unter 1024px sind die
+  // Reiter der Titel - ein Fehler, der die ganze Seite ersetzte, liess auf
+  // dem Telefon nur "Etwas ist schiefgelaufen" ohne jeden Hinweis, wo man
+  // ist. Der Fehler steht jetzt im Inhalt unter Titel und Reitern. Ein Reiter
+  // laedt neu (update() gibt nach einem Ladefehler false zurueck, der Router
+  // rendert die Seite also ganz).
+  loadFailed = false;
+  try {
+    await load();
+  } catch (error) {
+    if (root !== container) return;
+    loadFailed = true;
+    const shownView = scheduleViewFromPath(window.location?.pathname ?? '') ?? activeView;
+    container.replaceChildren();
+    container.insertAdjacentHTML('beforeend', `<div class="schedule-page app-page app-page--full" data-composition="full">
+    ${scheduleHeadHtml(shownView)}
+    <div class="schedule-body" id="schedule-body" role="tabpanel" tabindex="0"></div>
+  </div>`);
+    const tabsEl = container.querySelector('.schedule-tabs');
+    scheduleTablist = wireTablist(tabsEl, {
+      activeId: shownView,
+      manualActivation: true,
+      onChange: (id) => navigateToView(id),
+    });
+    attachSegmentIndicator(tabsEl);
+    mountLoadError(container.querySelector('.schedule-body'), {
+      title: t('common.errorOccurred'),
+      error,
+      retryLabel: t('common.retry'),
+      onRetry: () => render(container, { user }),
+    });
+    return;
+  }
   // S-10: ein ausdruecklicher Tab-Deep-Link (Dashboard-Kachel, Erinnerung,
   // ein gemerkter Browser-Verlaufseintrag) gewinnt IMMER - er ist eine
   // explizite Anfrage, keine geerbte Sitzungsvorgabe. Nur die nackte Wurzel
@@ -3249,7 +3518,13 @@ export async function render(container, { user } = {}) {
     // allerersten Laden entschieden (initialViewDecided), niemals danach - ein
     // spaeterer Besuch soll die eigene Tab-Wahl der Person nicht
     // ueberschreiben (siehe Kommentar an `activeView` oben).
-    activeView = 'overview';
+    //
+    // LEER STARTET ER AUF „SCHICHTARTEN" (Critique 2026-10-16, D3/D5): ohne
+    // eine einzige Schichtart und ohne Geplantes landete ein Erstnutzer auf
+    // „Vergleich" - einer Leseansicht ohne FAB, mit vier gleichrangigen
+    // Knoepfen im Leerzustand. Auf „Schichtarten" ist der FAB „+ Schichtart"
+    // der eine Anlege-Weg, die Vorlagen stehen leiser darunter.
+    activeView = planningNeedsShiftTypes() ? 'shifts' : 'overview';
     initialViewDecided = true;
   }
   // `statistics`/`overview`/`activeView` sind Modul-globaler Zustand, der eine
@@ -3290,7 +3565,7 @@ export async function render(container, { user } = {}) {
  * Rendern (hier nur, wenn der Container bereits verschwunden ist).
  */
 export async function update({ path } = {}) {
-  if (!root?.isConnected) return false;
+  if (!root?.isConnected || loadFailed) return false;
   const requestedView = scheduleViewFromPath(path || window.location.pathname);
   const nextView = requestedView ?? activeView;
   const resolvedRoute = scheduleRouteForView(nextView);
@@ -3307,4 +3582,4 @@ export async function update({ path } = {}) {
 // bereits pur bzw. nehmen ihre Eingabe jetzt als Parameter statt sie fest aus
 // `state` zu lesen - ein Test kann so echte Tage hineingeben und das Ergebnis
 // pruefen, statt nur zu belegen, dass der Funktionsname im Quelltext steht.
-export const __test = { availableTypeFields, shiftTypeFieldsEditor, syncTypeFieldPicker, editorAction, shiftTypeRow, patternRow, patternDaysEditorHtml, patternSaveOrder, initialOverviewSelection, renderOverview, renderToday, overviewLaneHeader, planningPanel, scheduleFabIntent, renderStatistics, patternFields, formField, shiftFields, reminderOffsetField, emptyShiftTypesState, emptyPatternState, emptyOverrideState, emptyExtraShiftsState, emptyCustomFieldsState, customFieldsSection, scheduleState: () => state, userOptions, setOwnerContext, overrideGroups, extraGroups, patternsInMemberOrder, rangeDifference, setShiftIconButtonIcon, overtimeInfo, sameFieldValues, overlayMeta, buildOverviewLanes, normalizeOverviewSelection, computeActiveHours, collapsedMinutes, isOvernightEntry, touchesVisibleDay, overviewFetchRange, patternDaysExceedingCycleLength, scheduleErrorMessage, cycleDayNextDate, cycleDayHeaderLabel, windowsOverlap, findOverlappingActivePattern, resolveWinningPatternId, scheduleEntryMatchKey };
+export const __test = { shiftTypeGroups, shiftTypeListHtml, PRESET_TEMPLATES, presetShortCode, presetAlreadyThere, NUMERIC_PRESET_CODES, setStatisticsEntries: (entries) => { statistics = { ...statistics, entries }; }, availableTypeFields, shiftTypeFieldsEditor, syncTypeFieldPicker, editorAction, shiftTypeRow, patternRow, patternDaysEditorHtml, patternSaveOrder, initialOverviewSelection, renderOverview, renderToday, overviewLaneHeader, planningPanel, scheduleFabIntent, renderStatistics, patternFields, formField, shiftFields, reminderOffsetField, emptyShiftTypesState, emptyPatternState, emptyOverrideState, emptyExtraShiftsState, emptyCustomFieldsState, customFieldsSection, scheduleState: () => state, userOptions, setOwnerContext, overrideGroups, extraGroups, patternsInMemberOrder, rangeDifference, wireRangeFollow, reportReversedRange, saveCreatedSchedule, setShiftIconButtonIcon, overtimeInfo, sameFieldValues, overlayMeta, buildOverviewLanes, normalizeOverviewSelection, computeActiveHours, collapsedMinutes, isOvernightEntry, touchesVisibleDay, overviewFetchRange, patternDaysExceedingCycleLength, scheduleErrorMessage, cycleDayNextDate, cycleDayHeaderLabel, windowsOverlap, findOverlappingActivePattern, resolveWinningPatternId, scheduleEntryMatchKey };

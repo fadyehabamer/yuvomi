@@ -36,8 +36,10 @@
  * geprüft und schalteten eine Stufe zu früh. Jetzt ist Container-Content ==
  * Grid-Breite. Folge: knapp oberhalb eines Breakpoints kippt die Spaltenzahl
  * eine Stufe nach unten (bei 900px Viewport 3 statt 4). Das ist die Korrektur
- * des alten Fehlers, keine Regression — die Werte 520/720/900/1200 bleiben
- * bewusst stehen und meinen jetzt echte Rasterbreite.
+ * des alten Fehlers, keine Regression — die Werte 520/720/1200 bleiben
+ * bewusst stehen und meinen jetzt echte Rasterbreite. Das Raster hat höchstens
+ * vier Spalten (#1765): die Stufe mit vier Spalten beginnt erst bei 1200px,
+ * damit eine Karte nirgends schmaler als 232px wird (bei 720px in drei Spalten).
  *
  * Container für das Masonry-Grid: Spaltenzahl reflowt nach EIGENEM Platz
  * (Sidebar-bewusst), nicht nach Viewport. Siehe tokens.css §11c. */
@@ -116,6 +118,15 @@
   display: none;
 }
 
+/* Platzhalter, solange die Reihe auf die Daten wartet (notes.js): drei
+ * Pillen in Chiphoehe, damit das Raster darunter nicht springt. */
+.notes-filters__skeleton {
+  flex: 0 0 auto;
+  inline-size: 4.5rem;
+  block-size: var(--target-md);
+  border-radius: var(--radius-full);
+}
+
 .notes-filter-group {
   display: flex;
   flex: 0 0 auto;
@@ -162,29 +173,6 @@
   margin-top: var(--space-4);
 }
 
-/* KEINE ERZWUNGENE LEERZEILE ZWISCHEN DEN GRUPPEN (Critique R17; notes.js,
- * syncGroupFlow). Fuellen die angepinnten Notizen ihre letzte Zeile nicht,
- * beginnt der Kopf der naechsten Gruppe in der ersten freien Spalte dieser
- * Zeile statt eine neue aufzumachen, und ihre Karten fliessen darunter weiter.
- * Die angepinnten Nachzuegler nehmen dafuer zwei Zeilen ein (Kopf + erste
- * Kartenzeile). Der Kopf sitzt UNTEN in seiner Zeile: ist der Nachzuegler
- * hoeher als Kopf plus Karten, waechst die Kopfzeile mit - der Kopf bleibt bei
- * seinen Karten statt bei der Oberkante des Nachbarn.
- *
- * Nur im Zeilenraster: natives Masonry (unten) kennt keine Zeilen, in die ein
- * Kopf sich einreihen koennte, und packt die Luecke ohnehin anders. */
-@supports not (grid-template-rows: masonry) {
-  .notes-group__title.notes-group__title--inline {
-    grid-column: var(--notes-label-start, 1) / -1;
-    align-self: end;
-    margin-top: 0;
-  }
-
-  .note-card--trailing {
-    grid-row: span 2;
-  }
-}
-
 /* Lade-Zustand: Grid aufheben, damit die geteilte Skeleton-Liste
  * (Flex-Spalte) full-width erscheint — eine Lade-Sprache über alle Module. */
 .notes-grid[aria-busy="true"] {
@@ -199,12 +187,8 @@
   .notes-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 
-@container notes-page (min-width: 900px) {
-  .notes-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-}
-
 @container notes-page (min-width: 1200px) {
-  .notes-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  .notes-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
 
 .notes-grid > .empty-state {
@@ -218,6 +202,16 @@
  * kein Intrinsic-Width-Risiko. */
 @supports (grid-template-rows: masonry) {
   .notes-grid { grid-template-rows: masonry; }
+}
+
+/* DER NAME, UNTER DEM MASONRY KOMMT (R19, Guide css-layout §8): die
+ * Spezifikation heisst inzwischen "grid lanes" (`display: grid-lanes`, Safari
+ * 26.4); `grid-template-rows: masonry` war der fruehere Prototyp. Die Spalten
+ * bleiben die der Container-Abfragen, die Gruppenkoepfe spannen ueber alle
+ * Bahnen und trennen die Gruppen. Der Lade-Zustand (`aria-busy`, oben) schlaegt
+ * die Regel per Spezifitaet. */
+@supports (display: grid-lanes) {
+  .notes-grid { display: grid-lanes; }
 }
 
 /* --------------------------------------------------------
@@ -268,11 +262,11 @@
   box-shadow: var(--shadow-md);
 }
 
-/* Gepinnt: voller Ring (kein Seitenstreifen) aus der eigenen Textfarbe —
- * deutlich sichtbar auf jeder Zettelfarbe, zusätzlich zum stärkeren Schatten. */
-.note-card--pinned {
-  box-shadow: var(--shadow-md), 0 0 0 2px color-mix(in srgb, currentColor 22%, transparent);
-}
+/* EINE KARTENHAUT (Critique 2026-10-16). Angepinnt trug die Karte einen
+ * 2px-Ring, den staerkeren Schatten und eine Nadel auf eigener Scheibe - eine
+ * zweite Haut neben der normalen. Den Zustand sagen jetzt die Nadel in voller
+ * Tinte (statt tertiaer) und die Gruppe „Angepinnt" darueber; Flaeche,
+ * Schatten und Nadelgroesse sind fuer beide gleich. */
 
 .note-card__pin {
   position: absolute;
@@ -305,8 +299,11 @@
 
 .note-card--pinned .note-card__pin {
   pointer-events: auto;
-  background: var(--note-action-bg);
   color: inherit;
+}
+
+.note-card--pinned .note-card__pin svg {
+  fill: currentColor;
 }
 
 .note-card__pin:not(.note-card__pin--static):hover,
@@ -592,36 +589,13 @@
   gap: var(--space-1);
 }
 
-.note-card__delete {
+/* Der Mehr-Knopf (R18, D6) ist die geteilte `.row-action`; auf der Karte
+ * steht er im Mass der Nadel. */
+.note-card__more {
   width: var(--target-base);
   height: var(--target-base);
-  /* Loeschen traegt seit Runde 5 die geteilte `.row-action` (48px-Minimum);
-   * auf der Karte gilt dasselbe Mass wie fuer die Nadel. */
   min-width: var(--target-base);
   min-height: var(--target-base);
-  border-radius: var(--radius-full);
-  /* Dauerhaft sichtbar und ruhig wie die Nadel (D7): keine Flaeche, die
-   * Tertiaerfarbe der geteilten `.row-action`. */
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  position: relative;
-  color: var(--color-text-tertiary);
-  transition: background-color var(--transition-fast), color var(--transition-fast);
-}
-
-.note-card__delete::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-}
-
-.note-card__delete:hover {
-  background: var(--color-danger-light);
-  color: var(--color-danger-ink);
 }
 
 /* DIE KARTE IST DER OEFFNEN-KNOPF (R9 M13). Der Knopf liegt unsichtbar ueber
@@ -689,18 +663,8 @@
     padding-top: var(--space-1);
   }
 
-  .note-card__delete {
+  .note-card__more {
     margin-block: calc((var(--space-6) - var(--target-base)) / 2);
-  }
-
-  /* Die Nadel einer angepinnten Notiz traegt ihre Flaeche als kleine Scheibe
-   * (32px) in der vollen Trefflaeche - vorher fuellte die Scheibe die ganzen
-   * 48px und war das groesste Zeichen der Karte. Zwei Klassen, weil die
-   * Kurzschrift `background` der angepinnten Nadel (0,2,0) den Clip sonst
-   * zuruecksetzt. */
-  .note-card .note-card__pin {
-    padding: var(--space-2);
-    background-clip: content-box;
   }
 }
 
@@ -758,16 +722,32 @@
   }
 }
 
-/* Leseansicht: gerendertes Markdown (.note-md-* aus typography.css) auf einer
- * dezent mit der Notizfarbe getönten Fläche (--note-color am .note-modal),
- * damit der Reader als „dieselbe Notiz, vergrößert" lesbar ist. Der Tint liegt
- * über transparent → theme-agnostisch; Text bleibt --color-text-primary für
- * durchgehend ≥4.5:1. Weiße Notizen ergeben keinen sichtbaren Tint. */
+/* LESEANSICHT: DER DIALOGKOERPER TRAEGT DIE ZETTELFARBE (R18, 2026-10-07).
+ *
+ * Bis dahin stand das gerenderte Markdown in einem KASTEN: getoente Flaeche,
+ * 12px Radius und eine Kante in 50 % der Notizfarbe. Bei einem roten oder
+ * rosa Zettel war das ein rosa Kasten mit roetlicher Kante direkt ueber dem
+ * roten "Loeschen" im Fuss - die Form einer Fehlermeldung.
+ *
+ * Jetzt ist der Zettel der Koerper selbst: die Ansicht zieht sich mit
+ * negativem Rand ueber die Polsterung von `.modal-panel__body` (--space-4,
+ * layout.css) bis an Kopf- und Fusslinie, ohne Kante und ohne Radius. Die
+ * FARBE ist dieselbe wie vorher (--note-color zu --tint-surface ueber der
+ * Tafel) - Text bleibt --color-text-primary, die Kontrastrechnung der
+ * Zettelfarben gilt unveraendert. Weisse Notizen ergeben keinen Tint. */
 .note-read-view {
+  margin: calc(-1 * var(--space-4));
   padding: var(--space-4);
-  border-radius: var(--radius-md);
   background: color-mix(in srgb, var(--note-color, transparent) var(--tint-surface), transparent);
-  border: 1px solid color-mix(in srgb, var(--note-color, transparent) var(--tint-hint), transparent);
+}
+
+/* EIN WEG ZUM BEARBEITEN. In der Leseansicht standen zwei: der Reiter
+ * "Bearbeiten" oben und der Primaerknopf "Bearbeiten" im Fuss. Der Knopf
+ * bleibt (er ist die Hauptaktion des Lesedialogs, Critique 2026-09-26); der
+ * Umschalter erscheint erst im Editor, wo "Lesen" die Vorschau ist und sonst
+ * kein Weg zurueck fuehrt. */
+.note-modal[data-view="read"] .note-mode-switch {
+  display: none;
 }
 
 .note-read__body {

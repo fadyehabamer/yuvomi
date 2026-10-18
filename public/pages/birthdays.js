@@ -2,10 +2,10 @@ import { api } from '/api.js';
 import { openModal as openSharedModal, closeModal, advancedSection } from '/components/modal.js';
 import { stagger, scheduleUndoableDelete } from '/utils/ux.js';
 import { wireSwipeRows, maybeShowSwipeHint } from '/utils/swipe-row.js';
-import { t, formatDate, parseDateInput, isDateInputValid, getLocale, formatUnit } from '/i18n.js';
+import { t, formatDate, formatMonthYear, parseDateInput, isDateInputValid, getLocale, formatUnit } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { initials } from '/utils/initials.js';
-import { rowActionHtml } from '/utils/row-action.js';
+import { rowMenuHtml } from '/utils/row-action.js';
 import { readRowHtml, readRowHintHtml } from '/utils/read-row.js';
 import { pageToolsMenuHtml, pageToolsActionEl, installPopoverMenus } from '/utils/popover-menu.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
@@ -20,7 +20,7 @@ import { openDetailView } from '/components/detail-view.js';
 // Alias: dieses Modul fuehrt selbst eine `emptyStateHtml()`, die den Renderer
 // mit den Geburtstags-Texten fuellt. Zwei Namen, die sich nur in der
 // Gross-Schreibung unterscheiden, waeren im Modul nicht auseinanderzuhalten.
-import { emptyStateHTML as sharedEmptyStateHTML, emptyHintHTML } from '/utils/empty-state.js';
+import { emptyStateHTML as sharedEmptyStateHTML, emptyHintHTML, searchEmptyHTML } from '/utils/empty-state.js';
 import { getReadableTextColor, AVATAR_FALLBACK_COLOR } from '/utils/color.js';
 import {
   renderAppPage,
@@ -40,6 +40,8 @@ let _container = null;
 // Liste + Detail (R10 L5): ab der Schwelle steht rechts der gewaehlte
 // Geburtstag. Ein Aufbau je Seitenaufbau (render), abgebaut mit dem Signal.
 let _md = null;
+/** Das Suchfeld (wirePageSearch) - der Leerzustand einer leeren Suche leert es. */
+let _search = null;
 
 /**
  * Darf dieser Nutzer Geburtstage schreiben?
@@ -378,7 +380,7 @@ function updateBirthdayBadge() {
   setNavBadge('/birthdays', countBirthdaysSoon(state.birthdays), undefined, 'accent');
 }
 
-export function birthdayItemHtml(birthday) {
+export function birthdayItemHtml(birthday, { next = false } = {}) {
   const chip = countdownChip(birthday);
   const isToday = chip.mod === 'today';
   const hasNameDay = birthday.next_name_day && Number.isInteger(birthday.name_day_days_until);
@@ -437,28 +439,58 @@ export function birthdayItemHtml(birthday) {
         <i data-lucide="trash-2" class="icon-md"></i>
         <span>${t('common.delete')}</span>
       </div>`}
-    <article class="list-row birthday-item ${isToday ? 'birthday-item--today' : ''}" data-id="${birthday.id}" data-md-id="${birthday.id}">
+    <article class="list-row birthday-item ${isToday ? 'birthday-item--today' : ''}${next && !isToday ? ' birthday-item--next' : ''}" data-id="${birthday.id}" data-md-id="${birthday.id}">
       <div class="birthday-item__media">${photoAvatar(birthday)}</div>
       <button type="button" class="list-row__main list-row__main--interactive" data-open="${birthday.id}" data-md-focus>${hauptspalte}${ro ? readRowHintHtml() : ''}</button>
       ${ro ? '' : `
       <div class="row-actions birthday-item__actions">
-        ${rowActionHtml({ icon: 'pencil', action: 'edit', label: t('common.editNamed', { name: birthday.name }), attrs: { 'data-id': birthday.id } })}
-        ${rowActionHtml({ icon: 'trash-2', tone: 'danger', action: 'delete', label: t('common.deleteNamed', { name: birthday.name }), attrs: { 'data-id': birthday.id } })}
+${/* EIN MEHR-KNOPF (Entscheidung 2026-10-07, utils/row-action.js): der
+             Tipp auf die Zeile oeffnet den Editor schon, Stift und Papierkorb
+             standen trotzdem in jeder Zeile. Beide sind jetzt Eintraege mit
+             Wort; Wischen bleibt der Zusatzweg. */ ''}
+        ${rowMenuHtml({
+          id: `birthday-menu-${birthday.id}`,
+          label: t('common.moreActionsNamed', { name: birthday.name }),
+          items: [
+            { action: 'edit', id: birthday.id, icon: 'pencil', label: t('common.edit') },
+            { action: 'delete', id: birthday.id, icon: 'trash-2', label: t('common.delete'), danger: true },
+          ],
+        })}
       </div>`}
     </article>
     </div>`;
+}
+
+/**
+ * MONATSGRUPPEN UND DER NAECHSTE (R19, Critique 2026-10-16). Die Liste war
+ * eine flache Folge, in der "in 16 Tagen" und "in 330 Tagen" gleich laut
+ * standen. Jetzt traegt jeder Monat einen Kopf ("November 2026", wie die
+ * Gruppenkoepfe der Aufgaben IN der Liste), und der naechste Geburtstag
+ * (`birthday-item--next`) hebt seinen Countdown im Modulton hervor - die
+ * Antwort auf die Frage, mit der man die Seite oeffnet.
+ * @param {Array} list nach Naehe sortiert (sortByProximity)
+ * @returns {string}
+ */
+function birthdayListHtml(list) {
+  let month = '';
+  return list.map((birthday, i) => {
+    const key = String(birthday.next_birthday ?? '').slice(0, 7);
+    const head = key && key !== month
+      ? `<h2 class="list-group__title birthdays-month">${esc(formatMonthYear(key.slice(0, 4), key.slice(5, 7)))}</h2>`
+      : '';
+    if (key) month = key;
+    return head + birthdayItemHtml(birthday, { next: i === 0 });
+  }).join('');
 }
 
 function emptyStateHtml() {
   // `cake` ist dasselbe Zeichen wie CAKE_SVG - das Inline-SVG oben ist die
   // Lucide-Torte, von Hand kopiert, damit sie neben einem Namen stehen kann.
   // Im Leerzustand nimmt der Renderer den Lucide-Namen direkt.
+  // Der EINE Leerzustand einer leeren Suche (R19) - hier stand nur der Satz
+  // „Keine Ergebnisse gefunden." ohne Begriff und ohne Ausweg.
   if (state.query.trim()) {
-    return sharedEmptyStateHTML({
-      variant: 'no-results',
-      icon: 'cake',
-      title: t('search.noResults'),
-    });
+    return searchEmptyHTML({ query: state.query, resetAttrs: { id: 'birthdays-reset-search' } });
   }
   // Bei `calendar: read` gehen mit dem CTA auch Beschreibung und Hinweis
   // (#1348): „Füge einen Geburtstag hinzu" und „Trage Geburtstage ein" laden
@@ -507,13 +539,19 @@ function drawList(host, { repaint = false } = {}) {
     host.replaceChildren();
     host.insertAdjacentHTML('beforeend', emptyStateHtml());
     host.querySelector('#birthdays-empty-cta')?.addEventListener('click', () => openBirthdayModal({ mode: 'create' }));
+    host.querySelector('#birthdays-reset-search')?.addEventListener('click', () => {
+      state.query = '';
+      _search?.clear();
+      renderList();
+      _search?.input?.focus();
+    });
     if (window.lucide) window.lucide.createIcons({ el: host });
     _md?.refresh();
     return;
   }
 
   host.replaceChildren();
-  host.insertAdjacentHTML('beforeend', list.map(birthdayItemHtml).join(''));
+  host.insertAdjacentHTML('beforeend', birthdayListHtml(list));
 
   if (window.lucide) window.lucide.createIcons({ el: host });
   // Der Nudge-Hinweis gehoert zur GESTE und steht deshalb in deren Verdrahtung:
@@ -685,7 +723,7 @@ function bindEvents() {
     }
   } catch { /* sessionStorage evtl. nicht verfügbar */ }
 
-  wirePageSearch(_container, {
+  _search = wirePageSearch(_container, {
     id: 'birthdays-search',
     delay: 0,
     onQuery: (value) => {
@@ -1218,31 +1256,45 @@ function deleteBirthday(id) {
  * (components/detail-view.js), damit die Spalte aussieht wie in Kontakten.
  */
 function birthdayPaneSections(birthday) {
-  const days = birthday.days_until;
-  let ageNote = '';
-  if (Number.isInteger(days)) {
-    if (days === 0) ageNote = t('birthdays.ageNoteToday', { age: birthday.next_age });
-    else if (days === 1) ageNote = t('birthdays.ageNoteTomorrow', { age: birthday.next_age });
-    else ageNote = t('birthdays.ageNoteDays', { days, age: birthday.next_age });
-  }
-  const hasPhoto = Boolean(birthday.photo_data || (birthday.family_user_id && birthday.family_avatar_data));
-  let photo = null;
-  if (hasPhoto) {
-    photo = document.createElement('div');
-    photo.className = 'birthday-pane__photo';
-    photo.insertAdjacentHTML('beforeend', photoAvatar(birthday, 'birthday-avatar--pane'));
-  }
   const nameDay = nameDayReadText(birthday.name_day);
   const nameDayNext = nameDay && Number.isInteger(birthday.name_day_days_until)
     ? `${nameDay} · ${countdownLabel(birthday.name_day_days_until)}` : nameDay;
   return [
-    { label: t('birthdays.photoLabel'), node: photo },
-    { icon: 'party-popper', label: birthday.next_birthday ? formatDate(birthday.next_birthday) : '', value: ageNote },
+    // Das Bild steht seit R18 im Kopf (birthdayDetailHead), gross und immer -
+    // auch als Monogramm, wo kein Foto hinterlegt ist.
+    // DIE ZEILE "02.11.2026 - Wird in 16 Tagen 41 Jahre alt." ENTFAELLT (R19,
+    // Critique 2026-10-16: "das Geburtstagsdetail sagt dasselbe dreimal").
+    // Alter und Abstand stehen als Kennzahlen im Kopf, das Datum als seine
+    // Unterzeile (birthdayDetailHead).
     { icon: 'cake', label: t('birthdays.birthDateLabel'), value: birthday.birth_date ? formatDate(birthday.birth_date) : '' },
     { icon: 'calendar-heart', label: t('birthdays.nameDay'), value: nameDayNext },
     { icon: 'align-left', label: t('birthdays.notesLabel'), value: birthday.notes || '', multiline: true },
     { icon: 'bell', label: t('reminders.offsetLabel'), value: reminderReadText(birthday) },
   ];
+}
+
+/**
+ * Der Kopf der Geburtstags-Leseansicht (components/detail-view.js
+ * `detailHeadEl`, Critique R18): das Bild gross, darunter die zwei Angaben,
+ * derentwegen man nachsieht - wie alt und wann. Dieselben Worte wie die
+ * Kachel der Uebersicht ("wird 41", "in 26 Tagen": `birthdays.turnsAge`,
+ * `countdownLabel`), keine neuen Texte.
+ */
+function birthdayDetailHead(birthday) {
+  const media = document.createElement('div');
+  media.className = 'birthday-pane__photo';
+  media.insertAdjacentHTML('beforeend', photoAvatar(birthday, 'birthday-avatar--pane'));
+  const days = birthday.days_until;
+  return {
+    media,
+    // Das Datum des naechsten Geburtstags, einmal: unter dem Bild, ueber Alter
+    // und Abstand (vorher zusaetzlich als erste Zeile darunter, R19).
+    subtitle: birthday.next_birthday ? formatDate(birthday.next_birthday) : '',
+    facts: [
+      birthday.next_age != null ? t('birthdays.turnsAge', { age: birthday.next_age }) : '',
+      Number.isInteger(days) ? countdownLabel(days) : '',
+    ],
+  };
 }
 
 /** Zeichnet den Geburtstag in die Spalte; `false` = gibt es nicht (mehr). */
@@ -1253,7 +1305,7 @@ function renderBirthdayPane(id, body) {
   openDetailView({
     title: birthday.name,
     key: `birthday:${birthday.id}`,
-    accentColor: 'var(--module-birthdays)',
+    head: birthdayDetailHead(birthday),
     pane: body,
     sections: birthdayPaneSections(birthday),
     // Nur-lesen: kein Loeschen, kein Bearbeiten - der Zustand bleibt lesbar.
@@ -1300,7 +1352,7 @@ function openBirthdaySheet(birthday) {
   openDetailView({
     title: birthday.name,
     key: `birthday:${birthday.id}`,
-    accentColor: 'var(--module-birthdays)',
+    head: birthdayDetailHead(birthday),
     size: 'md',
     sections: birthdayPaneSections(birthday),
     actions: [{
@@ -1352,6 +1404,31 @@ function syncBirthdaysDetailTop(page) {
   page.style.setProperty('--birthdays-detail-top', `${Math.round(detail.getBoundingClientRect().top)}px`);
 }
 
+/**
+ * `?open=<id>` UNTER der Spaltenschwelle (#1821): die Geburtstagszeile der
+ * Uebersicht und der Treffer der Suche nennen EINEN Anlass, also geht sein
+ * Leseblatt auf. In der Spalte hat der Baustein ihn schon ausgewaehlt, und
+ * dort bleibt der Parameter stehen - die Auswahl IST die Adresse.
+ *
+ * Unter der Schwelle verlaesst er die Adresse, BEVOR das Blatt aufgeht, und
+ * ohne eigenen History-Eintrag: dieselbe Regel wie bei den Notizen. Das Blatt
+ * ist ein Dialog; bliebe der Parameter, schluege es bei jedem Neuladen und bei
+ * jedem Zurueck auf diese Seite wieder auf. Die Reihenfolge zaehlt: das Blatt
+ * legt seinen Zurueck-Schritt auf die Adresse, die dann gilt.
+ *
+ * @returns {boolean} true, wenn ein Blatt aufging
+ */
+function openBirthdayFromQueryNarrow(md, find, { loc = window.location, openSheet = openBirthdaySheet } = {}) {
+  if (!md || md.isSplit()) return false;
+  const id = new URLSearchParams(loc.search ?? '').get('open');
+  if (id === null) return false;
+  md.clear({ history: 'replace' });
+  const birthday = find(id);
+  if (!birthday) return false;
+  openSheet(birthday);
+  return true;
+}
+
 function mountBirthdaysDetail(signal) {
   const root = _container?.querySelector('.birthdays-split');
   if (!root) return;
@@ -1359,6 +1436,9 @@ function mountBirthdaysDetail(signal) {
   _md = mountMasterDetail({
     root,
     signal,
+    // `deepLinkNarrow` bleibt aus: unter der Schwelle loest die SEITE den
+    // Link ein (openBirthdayFromQueryNarrow unten), weil der Parameter dort
+    // nach dem Einloesen aus der Adresse gehoert.
     renderDetail: (id, body) => renderBirthdayPane(id, body),
     // Unter der Schwelle das Leseblatt (E7), bei Nur-lesen die Leseansicht.
     openNarrow: (id) => {
@@ -1372,6 +1452,7 @@ function mountBirthdaysDetail(signal) {
   });
   const handle = _md;
   signal?.addEventListener('abort', () => { if (_md === handle) _md = null; }, { once: true });
+  openBirthdayFromQueryNarrow(_md, find);
   const page = _container.querySelector('.birthdays-page');
   syncBirthdaysHeadBlock(page);
   let frame = 0;
@@ -1411,6 +1492,7 @@ export async function render(container, { signal } = {}) {
  * verdrahtet werden, und was der Leerzustand anbietet.
  */
 export const __test = {
+  birthdayListHtml,
   birthdayItemHtml, emptyStateHtml, importActionHtml, wireBirthdaySwipe,
   readOnly, state,
   // Der Weg zur Leseansicht (#1348): wohin ein Tipp fuehrt und welcher Dialog
@@ -1418,5 +1500,7 @@ export const __test = {
   onListClick, openBirthdayModal,
   birthdayPreviewHtml,
   // R10 L5: die Detailspalte.
-  birthdayPaneSections, renderBirthdayPane,
+  birthdayPaneSections, birthdayDetailHead, renderBirthdayPane,
+  // #1821: `?open=` unter der Spaltenschwelle.
+  openBirthdayFromQueryNarrow,
 };

@@ -13,32 +13,34 @@
 
 import { api } from '/api.js';
 import { t, formatDate, formatMonthYear, formatTime, getLocale, getNumberFormat } from '/i18n.js';
-import { esc } from '/utils/html.js';
-import { CHART, chartScales, chartGridMarkup, chartXLabelsMarkup, chartX, chartY, niceDomain, chartTimePositions, chartTimeLabelsMarkup } from '/utils/chart.js';
-import { scheduleUndoableDelete, expandIn } from '/utils/ux.js';
+import { esc, REQUIRED_MARK } from '/utils/html.js';
+import { CHART, chartScales, chartGridMarkup, chartXLabelsMarkup, chartX, chartY, niceDomain, calmDomain, chartTimePositions, chartTimeLabelsMarkup } from '/utils/chart.js';
+import { scheduleUndoableDelete, expandIn, drawChartOnce } from '/utils/ux.js';
 import { swapContent } from '/utils/content-swap.js';
 import { toLocalDateKey, parseLocalDateKey, addLocalDays, todayKey} from '/utils/date.js';
 import { zonedDateKey } from '/utils/timezone.js';
 import { DATE_STATUS_ALERT_DAYS } from '/utils/date-status.js';
-import { nowFields } from '/utils/timezone.js';
+import { nowFields, nowDateTimeValue } from '/utils/timezone.js';
 import { trendMarkup } from '/utils/metric-card.js';
-import { openModal, closeModal, confirmModal, confirmOverModal, reportFieldError, advancedSection, refocusAfterRender } from '/components/modal.js';
+import { openModal, closeModal, confirmModal, confirmOverModal, reportFieldError, reportFieldErrors, advancedSection, refocusAfterRender } from '/components/modal.js';
 import { createPageFab, setPageFabAction } from '/utils/fab.js';
 import { rowActionHtml } from '/utils/row-action.js';
+import { formRowsHtml, formRowHtml, formCompositeHtml } from '/utils/form-row.js';
+import { toggleRowHtml } from '/settings/components.js';
 import { installPopoverMenus, pageToolsMenuHtml } from '/utils/popover-menu.js';
 import { personSwitcherMarkup } from '/utils/health-person-switcher.js';
 import { attachSegmentIndicator } from '/utils/segment-indicator.js';
 import {
   computeVitalSeries, stepVitalAnchor, VITAL_METRICS, vitalMetric,
-  MOOD_SCALE, moodStep, splitDuration, durationToHours,
+  MOOD_SCALE, moodStep, splitDuration, durationToHours, vitalPlausibility,
 } from '/utils/health-vitals.js';
 import {
-  computeDueDoses, computeAdherence, refillState,
+  computeDueDoses, computeAdherence, refillState, medicationCountsToday, currentSchedules,
   daysMaskToIndices, indicesToDaysMask, WEEKDAY_COUNT, weekdayIndex,
   prnDoseState, splitRemaining, toLocalStamp, parseLogInstant, scheduledLogs,
 } from '/utils/health-meds.js';
 import {
-  deriveFlag, summarizeReport, analyteNames, analyteTrend, LAB_FLAGS,
+  deriveFlag, summarizeReport, analyteNames, analyteTrend, defaultTrendAnalyte, LAB_FLAGS,
 } from '/utils/health-labs.js';
 import {
   ACTIVITY_TYPES, activityType, weekSummary, activityTotals, stepActivityAnchor,
@@ -62,9 +64,11 @@ import {
 } from '/utils/health-tabs.js';
 import { mountMasterDetail, splitViewDetailHtml } from '/utils/master-detail.js';
 import { hoistPlan, applyHoistPlan } from '/utils/health-hoist.js';
+import { renderSkeletonList, renderSkeletonChart } from '/utils/skeleton.js';
 import { formatFastingDuration } from '/utils/health-fasting.js';
 import { canUseFasting, isNavModuleReadOnly } from '/permissions.js';
 import { emptyStateHTML, emptyHintHTML, mountLoadError } from '/utils/empty-state.js';
+import { errorSentence, isGone } from '/utils/friendly-error.js';
 import { intervalMonthsToInput, intervalInputToMonths } from '/utils/health-prevention.js';
 import { NUTRIENTS, MEAL_TYPES, nutrientProgress } from '/utils/health-nutrition.js';
 
@@ -539,6 +543,13 @@ function updateHealthFab(activeRoute) {
       setPageFabAction(_fab, { hidden: !canEditFor(activity.personId, activity.meId), label: t('health.activity.add'), dockLabel: t('newLabel.healthActivity'), onClick: () => openActivityModal(null) }); break;
     case '/health/nutrition':
       setPageFabAction(_fab, { hidden: !canEditFor(nutrition.personId, nutrition.meId), label: t('health.nutrition.add'), dockLabel: t('newLabel.healthNutrition'), onClick: () => openNutritionModal(null) }); break;
+    case '/health/fasting':
+      // EIN WEG JE BEREICH (Critique 2026-10-16, D5): ein abgeschlossenes
+      // Fasten trug man ueber einen Knopf im Leerzustand ODER im Kopf des
+      // Verlaufs nach, ohne FAB. Jetzt ist es der FAB wie in jedem Bereich
+      // (am Desktop die Pille „+ Fasten"). Der Timer bleibt, was er ist: ein
+      // Bedienelement des laufenden Fastens, kein Anlege-Weg.
+      setPageFabAction(_fab, { hidden: !_fastingCreate, label: t('health.fasting.backfill'), dockLabel: t('health.fasting.title'), onClick: () => _fastingCreate?.() }); break;
     default:
       // Das Nomen bleibt stehen: der Router dockt den Knopf am Desktop nur beim
       // Seitenaufbau an und nur mit `data-dock-label`. Wer auf der Uebersicht
@@ -691,13 +702,77 @@ function syncDetailHead() {
 /* DER NEUE BEREICH BLENDET EIN - IN JEDER BREITE (R14 P11, R16 Bewegung).
  * Schmal schaltete der Wechsel nur `hidden` um; seit R14 blendete er dort,
  * am Desktop schnitt die Detailspalte weiter hart. Jetzt ueber den geteilten
- * Helfer (utils/content-swap.js): nur Deckkraft, kein Versatz - die Bereiche
+ * Helfer (utils/content-swap.js). Zwischen zwei Bereichen nur Deckkraft: sie
  * stehen untereinander in einer Liste, eine Seitwaertsrichtung gibt es nicht.
+ *
+ * SCHMAL IST DER BEREICH EINE EBENE TIEFER (R18): dort ersetzt er die
+ * Uebersicht, und Zurueck fuehrt zu ihr. Hinein gleitet er deshalb von der
+ * Seite, zu der man geht (`direction` +1), zurueck die Uebersicht von der
+ * anderen (-1) - 8px, in RTL gespiegelt, unter reduzierter Bewegung nur die
+ * Blende. In der Split-Ansicht steht die Liste daneben, es bleibt bei 0.
+ *
  * Der Tausch selbst ist das Umschalten von `hidden` davor; hier laeuft nur
- * die Blende, und ein zweiter Wechsel bricht sie ab. */
-function markAreaEntering(route) {
+ * die Bewegung, und ein zweiter Wechsel bricht sie ab. */
+function markAreaEntering(route, direction = 0) {
   const panel = [..._container.querySelectorAll('[data-health-panel]')].find((p) => p.dataset.healthPanel === route);
-  if (panel) swapContent(panel, null);
+  if (panel) swapContent(panel, null, { direction });
+}
+
+/* DIE "HEUTE"-REGION SPRINGT NICHT INS BILD (R18, Ursache zu #1770).
+ *
+ * Die Region vor der Bereichsliste war leer und per `:has()` auf
+ * `display: none`, bis die Uebersicht geladen und ihre Karten umgezogen waren
+ * (health-hoist.js). Dann erschien sie mit rund 480px auf einmal: die
+ * Bereichsliste rutschte bei 390x844 von y=81 auf y=577, Layout-Shift 0,58
+ * (drei Laeufe). Wer in dem Moment eine Bereichszeile antippen wollte, traf
+ * eine andere.
+ *
+ * Auf dem Telefon steht die Region deshalb vom ersten Bild an, mit einem
+ * Skelett in der Form dessen, was kommt: Personen-Pille, "Heute faellig",
+ * "Schnell erfassen". Die Hoehe der Karten haengt an den Daten (wie viele
+ * Einnahmen heute faellig sind), also merkt sich das Modul die zuletzt
+ * gemessene Hoehe - beim zweiten Aufruf der Sitzung passt das Skelett genau,
+ * beim ersten steht die Liste ohnehin schon unter dem Falz.
+ *
+ * `_priorityPending` gilt nur, solange Inhalt ERWARTET wird: am Tablet und am
+ * Desktop zieht nichts in die Region, dort bleibt sie weg (keine leere
+ * Landmarke), und nach einem Ladefehler faellt die Marke ebenfalls. */
+let _priorityPending = false;
+let _priorityHeight = 0;
+
+function prioritySkeletonMarkup() {
+  return `<div class="health-priority-skeleton" data-health-priority-skeleton aria-hidden="true">
+              <div class="skeleton health-priority-skeleton__pill"></div>
+              <div class="skeleton-card health-priority-skeleton__card health-priority-skeleton__card--due">
+                <div class="skeleton skeleton-line skeleton-line--title"></div>
+                <div class="skeleton skeleton-line skeleton-line--medium"></div>
+                <div class="skeleton skeleton-line skeleton-line--full"></div>
+              </div>
+              <div class="skeleton-card health-priority-skeleton__card health-priority-skeleton__card--quick">
+                <div class="skeleton skeleton-line skeleton-line--title"></div>
+                <div class="skeleton skeleton-line skeleton-line--full"></div>
+              </div>
+            </div>`;
+}
+
+/** Die Marke an der Region nachfuehren und die Hoehe des Inhalts merken. */
+function syncPriorityRegion() {
+  const region = _container?.querySelector('.health-priority-region');
+  const slot = region?.querySelector('[data-health-priority]');
+  if (!region || !slot) return;
+  const filled = slot.children.length > 0;
+  const overviewActive = (_activeArea ?? HEALTH_OVERVIEW_ID) === HEALTH_OVERVIEW_ID;
+  if (filled || !overviewActive || !isPhone()) _priorityPending = false;
+  region.toggleAttribute('data-health-priority-pending', _priorityPending);
+  const skeleton = region.querySelector('[data-health-priority-skeleton]');
+  if (skeleton && _priorityPending && _priorityHeight > 0) skeleton.style.minBlockSize = `${_priorityHeight}px`;
+  if (filled && typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(() => {
+      if (!slot.isConnected || slot.children.length === 0) return;
+      const height = slot.getBoundingClientRect().height;
+      if (height > 0) _priorityHeight = Math.round(height);
+    });
+  }
 }
 
 /* Personenwahl und „Heute" an ihren Ort je Darstellung (health-hoist.js). */
@@ -715,6 +790,7 @@ function syncHoists() {
       priority: _container.querySelector('[data-health-priority]'),
     },
   });
+  syncPriorityRegion();
   // Die eigenen Umzuege sind keine Neubauten der Panels.
   _hoistObserver?.takeRecords();
 }
@@ -757,7 +833,8 @@ function activateArea(id) {
   for (const panel of _container.querySelectorAll('[data-health-panel]')) {
     panel.hidden = panel.dataset.healthPanel !== route;
   }
-  if (previous && previous !== id) markAreaEntering(route);
+  const drill = !narrow ? 0 : id === HEALTH_OVERVIEW_ID ? -1 : previous === HEALTH_OVERVIEW_ID ? 1 : 0;
+  if (previous && previous !== id) markAreaEntering(route, drill);
   rememberHealthRoute(route);
   syncHealthHeader();
   updateHealthFab(route);
@@ -1006,6 +1083,11 @@ export async function render(container, ctx = {}) {
   }
   const panels = PANELS().filter((panel) => (cycleEnabled || panel.route !== '/health/cycle') && (fastingEnabled || panel.route !== '/health/fasting'));
 
+  // Auf dem Telefon kommt vor der Bereichsliste gleich Inhalt (health-hoist.js):
+  // die Region steht deshalb vom ersten Bild an, mit Skelett (R18, #1770).
+  _priorityPending = activeRoute === '/health' && isPhone();
+  const priorityPending = _priorityPending;
+
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
     <div class="health-page app-page app-page--dashboard app-page--list-detail" data-composition="dashboard">
@@ -1032,9 +1114,10 @@ export async function render(container, ctx = {}) {
                VOR der Bereichsliste (health-hoist.js, R14 P3). Die h2 steht
                vor dem Umzugsziel, nicht darin: die Karten bringen ihre h3 mit,
                ohne sie folgten sie direkt auf das h1. -->
-          <section class="health-priority-region" aria-labelledby="health-priority-title">
+          <section class="health-priority-region" aria-labelledby="health-priority-title"${priorityPending ? ' data-health-priority-pending' : ''}>
             <h2 class="sr-only" id="health-priority-title">${esc(t('common.today'))}</h2>
             <div class="health-priority" data-health-priority></div>
+            ${prioritySkeletonMarkup()}
           </section>
           ${areasNavMarkup()}
           <div class="health-stage" data-health-stage></div>
@@ -1184,7 +1267,7 @@ async function loadHealthMembers(view, user) {
 async function mountVitals() {
   vitals.root.replaceChildren();
   vitals.root.insertAdjacentHTML('beforeend',
-    `<div class="health-vitals__loading">${esc(t('common.loading'))}</div>`);
+    areaLoadingMarkup('vitals', 'chart'));
 
   try {
     await loadHealthMembers(vitals, healthUser);
@@ -1200,8 +1283,9 @@ async function mountVitals() {
 
 async function loadVitals() {
   const query = vitals.personId ? `?user_id=${encodeURIComponent(vitals.personId)}` : '';
+  const load = beginLoad('vitals');
   const res = await api.get(`/health/vitals${query}`);
-  vitals.rows = res.data || [];
+  vitals.rows = withoutPendingDeletes('vitals', res.data || [], load);
 }
 
 function renderVitalsShell() {
@@ -1224,7 +1308,7 @@ function renderVitalsShell() {
             data-range="${r}" role="tab" aria-selected="${r === vitals.range}">${esc(t(RANGE_LABELS[r]))}</button>`).join('')}
       </div>
     </div>
-    <div class="health-vitals__cards" id="health-vitals-cards"></div>
+    <div class="health-vitals__cards metric-rows" id="health-vitals-cards"></div>
     <div class="health-vitals__more" id="health-vitals-more"></div>
     <div class="health-vitals__detail" id="health-vitals-detail"></div>
   `);
@@ -1426,6 +1510,11 @@ function renderCards() {
   host.replaceChildren();
   host.insertAdjacentHTML('beforeend', cards);
   if (window.lucide) window.lucide.createIcons({ el: host });
+  // Die Mini-Trendlinien zeichnen sich wie das Detail-Diagramm EINMAL je
+  // Messgroesse und Sitzung ein (Critique 2026-10-16, A5: sie standen ohne
+  // jede Einblendung da). Ohne Achse beschneidet der Helfer das ganze Bild.
+  host.querySelectorAll('.metric-card__spark').forEach((spark) =>
+    drawChartOnce(`health-spark-${spark.closest('[data-type]')?.dataset.type ?? ''}`, { lines: spark }));
 
   host.querySelectorAll('.metric-card--select').forEach((card) =>
     card.addEventListener('click', () => {
@@ -1505,6 +1594,9 @@ function watchPhoneQuery() {
     if (vitals.root?.isConnected && vitals.loaded && !vitals.error) renderCards();
     // Die Uebersicht ordnet ihre Karten je Breite anders (overviewGridMarkup).
     if (overview.root?.isConnected && overview.loaded && !overview.error) renderOverviewShell();
+    // Das Aktivitaets-Diagramm rechnet je Breite auf einer anderen Flaeche
+    // (activityChartGeometry) - sonst bliebe nach dem Drehen die alte stehen.
+    if (activity.root?.isConnected && activity.loaded && !activity.error) renderActivityShell();
     syncHoists();
   });
 }
@@ -1547,6 +1639,26 @@ function cardMarkup(metric, series, { phone = false } = {}) {
     </button>`;
 }
 
+/**
+ * Laesst die Diagramme eines Bereichs (Aktivitaet, Laborwerte, Zyklus-Trends)
+ * sich EINMAL je Sitzung einzeichnen (Critique 2026-10-16, A5: sie standen ohne
+ * jede Einblendung da, waehrend Budget-Berichte und Vitalkurven sich
+ * einzeichnen). Linien haengen an `.health-chart__lines`, Balken tragen
+ * `.chart__bar`; Raster und Achse stehen. Den Merker benennt das Diagramm
+ * selbst (`aria-label`), ein neuer Analyt ist ein neues Diagramm, eine neue
+ * Woche nicht. Der Helfer ist `drawChartOnce` (utils/ux.js).
+ * @param {ParentNode|null} root
+ * @param {string} prefix  Bereich, Teil des Merkers
+ */
+function drawHealthCharts(root, prefix) {
+  root?.querySelectorAll?.('svg.health-chart').forEach((svg) => {
+    drawChartOnce(`${prefix}:${svg.getAttribute('aria-label') ?? ''}`, {
+      lines: svg.querySelector('.health-chart__lines'),
+      bars: svg.querySelectorAll('.chart__bar'),
+    });
+  });
+}
+
 // Mini-Trendlinie für die Metrik-Karte: gibt der Karte Sub-Domänen-Charakter, ohne
 // den vollen Chart zu wiederholen. Rein dekorativ (aria-hidden) — die exakten Werte
 // liefern Karte, Detail-Chart und Screenreader-Tabelle. Nur bei ≥2 Datenpunkten.
@@ -1571,12 +1683,22 @@ function sparklineMarkup(points, key, metric) {
   const pts = withVal.map((o, idx) => `${x(idx).toFixed(1)},${y(o.v).toFixed(1)}`).join(' ');
   const lastX = x(n - 1).toFixed(1);
   const lastY = y(withVal[n - 1].v).toFixed(1);
-  // Farbe steht in panel.css am geteilten Bauteil, nicht hier: sie ist eine
-  // Aussage über den WERT und gehört deshalb der Karte, nicht dem Modul.
+  // Farbe steht in panel.css am geteilten Bauteil, nicht hier (R18: Modulton
+  // mit Flaechenverlauf, Begruendung dort). Die Flaeche schliesst die Linie
+  // unten; ihr Verlauf braucht eine Kennung je Metrik, weil mehrere Trendlinien
+  // im selben Dokument stehen. Der letzte Punkt ist eine Linie der Laenge null
+  // mit runder Kappe: ein `<circle>` wurde von `preserveAspectRatio="none"`
+  // zur Ellipse gestreckt (gemessen 100x26 auf 176x22).
+  const fillId = `metric-spark-${String(metric?.type ?? key).replace(/[^a-z0-9_-]/gi, '')}`;
+  const end = `x1="${lastX}" x2="${lastX}" y1="${lastY}" y2="${lastY}" vector-effect="non-scaling-stroke"`;
   return `<svg class="metric-card__spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
+      <defs><linearGradient id="${fillId}" x1="0" y1="0" x2="0" y2="1">
+        <stop class="metric-card__spark-from" offset="0" /><stop class="metric-card__spark-to" offset="1" />
+      </linearGradient></defs>
+      <polygon class="metric-card__spark-area" fill="url(#${fillId})" points="${x(0).toFixed(1)},${H} ${pts} ${lastX},${H}" />
       <polyline points="${pts}" fill="none" stroke-width="1.5"
         stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke" />
-      <circle cx="${lastX}" cy="${lastY}" r="2" vector-effect="non-scaling-stroke" />
+      <line class="metric-card__spark-ring" ${end} /><line class="metric-card__spark-end" ${end} />
     </svg>`;
 }
 
@@ -1617,6 +1739,12 @@ function renderDetail() {
     </div>
     ${recentMeasurementsMarkup(metric)}`);
   if (window.lucide) window.lucide.createIcons({ el: host });
+  // DIE KURVE ZEICHNET SICH EINMAL EIN (Critique R18): die Vitaldiagramme
+  // standen fertig da, waehrend die Berichte im Budget sich einzeichnen. Einmal
+  // je Messgroesse und Sitzung - wer den Zeitraum blaettert, vergleicht und
+  // wartet nicht noch einmal 300ms (drawChartOnce, utils/ux.js). Raster und
+  // Achse stehen; der Beschnitt haengt an der Gruppe aus Flaeche und Kurven.
+  drawChartOnce(`health-vitals-${metric.type}`, { lines: host.querySelector('.health-chart__lines') });
 
   host.querySelectorAll('[data-step]').forEach((btn) =>
     btn.addEventListener('click', () => {
@@ -1640,15 +1768,65 @@ function renderDetail() {
     }));
 }
 
+/**
+ * ZEILEN IN DER RUECKNAHMEFRIST (Codex an #1971): lokal schon entfernt, am
+ * Server noch da, bis ihr Loeschen nach fuenf Sekunden laeuft. Laedt ein
+ * Bereich in dieser Zeit nach (ein anderes Loeschen kam mit "gibt es nicht
+ * mehr" zurueck, ein Speichern, der Bilanz-Abruf der Naehrwerte), kaemen sie
+ * sonst zurueck - und blieben stehen, weil ihr eigenes Loeschen nicht nachlaedt.
+ *
+ * Je Bereich: Id -> Ladenummer, ab der die Zeile nicht mehr zu filtern ist.
+ * Solange das Loeschen aussteht, Infinity. Ist es gelungen, die Nummer des
+ * letzten BEGONNENEN Ladens: eine Antwort, die vorher losging, kann die Zeile
+ * noch tragen und bleibt gefiltert; erst ein Laden, das danach beginnt, ist
+ * massgeblich und raeumt den Eintrag ab (eine spaeter vergebene gleiche Id
+ * bliebe sonst unsichtbar). Scheitert das Loeschen oder wird es
+ * zurueckgenommen, geht der Eintrag sofort.
+ */
+const pendingDeletes = { vitals: new Map(), prevention: new Map(), nutrition: new Map() };
+const loadCounter = { vitals: 0, prevention: 0, nutrition: 0 };
+
+/** Nummer eines Ladens, das JETZT beginnt (vor dem Abruf zu ziehen). */
+function beginLoad(area) {
+  loadCounter[area] += 1;
+  return loadCounter[area];
+}
+
+function withoutPendingDeletes(area, rows, load) {
+  const pending = pendingDeletes[area];
+  if (!pending.size) return rows;
+  const kept = rows.filter((row) => !pending.has(row.id));
+  for (const [id, until] of pending) {
+    if (load > until) pending.delete(id);
+  }
+  return kept;
+}
+
+async function commitPendingDelete(area, id, run) {
+  try {
+    await run();
+  } catch (err) {
+    pendingDeletes[area].delete(id);
+    throw err;
+  }
+  pendingDeletes[area].set(id, loadCounter[area]);
+}
+
+function markPendingDelete(area, id) {
+  pendingDeletes[area].set(id, Infinity);
+}
+
 /** Loeschen einer Messung mit Undo-Toast statt Confirm (Hausmuster). */
 function deleteVitalWithUndo(id) {
   const idx = vitals.rows.findIndex((r) => r.id === id);
   if (idx === -1) return;
   const [row] = vitals.rows.splice(idx, 1);
+  markPendingDelete('vitals', id);
   renderVitalsShell();
   scheduleUndoableDelete({
-    commit: ({ keepalive } = {}) => api.delete(`/health/vitals/${id}`, { keepalive }),
-    restore: () => { vitals.rows.splice(idx, 0, row); renderVitalsShell(); },
+    commit: ({ keepalive } = {}) => commitPendingDelete('vitals', id, () => api.delete(`/health/vitals/${id}`, { keepalive })),
+    restore: (err) => restoreOrReload(err, 'health.vitals.saveError', reloadVitals,
+      () => { pendingDeletes.vitals.delete(id); vitals.rows.splice(idx, 0, row); renderVitalsShell(); }),
     message: t('health.vitals.measurementDeleted'),
   });
 }
@@ -1787,6 +1965,7 @@ function renderVitalSheet(host) {
   host.replaceChildren();
   host.insertAdjacentHTML('beforeend', vitalSheetMarkup(metric));
   if (window.lucide) window.lucide.createIcons({ el: host });
+  drawChartOnce(`health-vital-sheet-${metric.type}`, { lines: host.querySelector('.health-chart__lines') });
   wireTablistKeys(host);
   attachSegmentIndicator(host.querySelector('.health-vital-sheet__ranges'), { key: 'health-vital-sheet-range' });
 
@@ -1925,8 +2104,10 @@ function chartMarkup(metric, series, geo = CHART) {
     <svg class="chart health-chart" viewBox="0 0 ${W} ${H}" role="img"${ratio}
          aria-label="${esc(t(metric.labelKey))}">
       ${grid}
-      ${area}
-      ${seriesSvg}
+      <g class="health-chart__lines">
+        ${area}
+        ${seriesSvg}
+      </g>
       ${xLabels}
     </svg>
     ${table}
@@ -1937,12 +2118,10 @@ function chartMarkup(metric, series, geo = CHART) {
 // Erfassungs-Modal
 // --------------------------------------------------------
 
-function localDateTimeValue(date) {
-  const key = toLocalDateKey(date);
-  const hh = String(date.getHours()).padStart(2, '0');
-  const mm = String(date.getMinutes()).padStart(2, '0');
-  return `${key}T${hh}:${mm}`;
-}
+// Beispielwerte als Platzhalter des Blutdruck-Paars und die Einheit des
+// Pulses. Zahlen und ein Einheitenzeichen, keine Texte - wie `metric.units`.
+const PAIR_EXAMPLE = Object.freeze({ systolic: 120, diastolic: 80, pulse: 72 });
+const PULSE_UNIT = '/min';
 
 function valueFieldsMarkup(type, row = null) {
   const metric = vitalMetric(type) || VITAL_METRICS[0];
@@ -1955,17 +2134,24 @@ function valueFieldsMarkup(type, row = null) {
   // ist eine Rechnung, die der Erfassende sonst im Kopf machen müsste.
   if (metric.format === 'duration') {
     const parts = row && has(row.value_num) ? splitDuration(row.value_num) : null;
-    return `
-      <div class="modal-grid modal-grid--2">
-        <div class="form-field">
-          <label class="label" for="vital-hours">${esc(t('health.vitals.field.hours'))}</label>
-          <input class="input" id="vital-hours" type="number" inputmode="numeric" step="1" min="0" max="24" required${parts ? ` value="${esc(String(parts.hours))}"` : ''}>
-        </div>
-        <div class="form-field">
-          <label class="label" for="vital-minutes">${esc(t('health.vitals.field.minutes'))}</label>
-          <input class="input" id="vital-minutes" type="number" inputmode="numeric" step="1" min="0" max="59" value="${esc(String(parts ? parts.minutes : 0))}">
-        </div>
-      </div>
+    // EIN zusammengesetztes Feld: "7 Stunden 30 Minuten". Die Worte hinter den
+    // Zahlen SIND die Etiketten der Teilfelder (`<label for>`).
+    return `${formRowHtml({
+      label: t(metric.labelKey),
+      labelId: 'vital-duration-label',
+      field: true,
+      control: formCompositeHtml({
+        labelledBy: 'vital-duration-label',
+        parts: [
+          { id: 'vital-hours', label: t('health.vitals.field.hours'), suffix: t('health.vitals.field.hours'), suffixIsLabel: true,
+            value: parts ? parts.hours : null,
+            attrs: { type: 'number', inputmode: 'numeric', step: '1', min: '0', max: '24', required: true } },
+          { id: 'vital-minutes', label: t('health.vitals.field.minutes'), suffix: t('health.vitals.field.minutes'), suffixIsLabel: true,
+            value: parts ? parts.minutes : 0,
+            attrs: { type: 'number', inputmode: 'numeric', step: '1', min: '0', max: '59' } },
+        ],
+      }),
+    })}
       <input type="hidden" id="vital-unit" value="${esc(metric.units[0] || '')}">`;
   }
 
@@ -1973,37 +2159,60 @@ function valueFieldsMarkup(type, row = null) {
   // Auswahl-Chip wie Flow und Symptome im Zyklus-Tagebuch (.health-choice).
   if (metric.format === 'scale') {
     const chosen = row && has(row.value_num) ? moodStep(row.value_num)?.value : null;
-    return `
-      <div class="form-field">
-        <span class="label">${esc(t('health.vitals.field.mood'))}</span>
-        <div class="health-choices health-choices--scale" data-group="mood" role="group"
-             aria-label="${esc(t('health.vitals.field.mood'))}">
+    // Eine Skala steht neben keinem Etikett: gestapelte Zeile.
+    return `${formRowHtml({
+      label: t('health.vitals.field.mood'),
+      labelId: 'vital-mood-label',
+      stacked: true,
+      field: true,
+      control: `<div class="health-choices health-choices--scale" data-group="mood" role="group"
+             aria-labelledby="vital-mood-label">
           ${MOOD_SCALE.map((step) => `
             <button type="button" class="health-choice" data-mood="${esc(step.value)}" aria-pressed="${step.value === chosen ? 'true' : 'false'}">
               <i data-lucide="${esc(step.icon)}" aria-hidden="true"></i>
               <span class="health-choice-label">${esc(t(step.labelKey))}</span>
             </button>`).join('')}
-        </div>
-      </div>
+        </div>`,
+    })}
       <input type="hidden" id="vital-unit" value="">`;
   }
 
   if (metric.format === 'pair') {
-    return `
-      <div class="modal-grid modal-grid--3">
-        <div class="form-field">
-          <label class="label" for="vital-sys">${esc(t('health.vitals.field.systolic'))}</label>
-          <input class="input" id="vital-sys" type="number" inputmode="numeric" step="1" min="0" required${valueAttr(row?.value_num)}>
-        </div>
-        <div class="form-field">
-          <label class="label" for="vital-dia">${esc(t('health.vitals.field.diastolic'))}</label>
-          <input class="input" id="vital-dia" type="number" inputmode="numeric" step="1" min="0" required${valueAttr(row?.value_num2)}>
-        </div>
-        <div class="form-field">
-          <label class="label" for="vital-pulse">${esc(t('health.vitals.field.pulse'))}</label>
-          <input class="input" id="vital-pulse" type="number" inputmode="numeric" step="1" min="0"${valueAttr(row?.value_num3)}>
-        </div>
-      </div>`;
+    // DER BLUTDRUCK IST EIN WERT, KEINE DREI KAESTEN (R18, 2026-10-07): bis
+    // dahin drei gleich breite Felder "Systolisch", "Diastolisch", "Puls" ohne
+    // Einheit. Jetzt steht er, wie man ihn sagt - "120 / 80 mmHg" -, der Puls
+    // als eigene Zeile darunter. Die Teilfelder behalten ihre ids und Namen
+    // (Screenreader: Gruppe "Blutdruck", "Systolisch", "Diastolisch, mmHg").
+    // Die Platzhalter sind Beispielwerte, keine Vorgaben.
+    return formRowHtml({
+      label: t(metric.labelKey),
+      labelId: 'vital-pair-label',
+      field: true,
+      control: formCompositeHtml({
+        labelledBy: 'vital-pair-label',
+        unit: metric.units[0],
+        parts: [
+          { id: 'vital-sys', label: t('health.vitals.field.systolic'), value: has(row?.value_num) ? row.value_num : null,
+            placeholder: PAIR_EXAMPLE.systolic,
+            attrs: { type: 'number', inputmode: 'numeric', step: '1', min: '0', required: true } },
+          { separator: '/' },
+          { id: 'vital-dia', label: t('health.vitals.field.diastolic'), value: has(row?.value_num2) ? row.value_num2 : null,
+            placeholder: PAIR_EXAMPLE.diastolic,
+            attrs: { type: 'number', inputmode: 'numeric', step: '1', min: '0', required: true } },
+        ],
+      }),
+    }) + formRowHtml({
+      label: t('health.vitals.field.pulse'),
+      labelFor: 'vital-pulse',
+      field: true,
+      control: formCompositeHtml({
+        parts: [
+          { id: 'vital-pulse', suffix: PULSE_UNIT,
+            value: has(row?.value_num3) ? row.value_num3 : null, placeholder: PAIR_EXAMPLE.pulse,
+            attrs: { type: 'number', inputmode: 'numeric', step: '1', min: '0' } },
+        ],
+      }),
+    });
   }
   /* EINE UNBEKANNTE EINHEIT WURDE STILL ZUR ERSTEN (Codex an #1485): stand
    * die gespeicherte Einheit nicht in der Liste (per API oder Import erfasst,
@@ -2012,23 +2221,24 @@ function valueFieldsMarkup(type, row = null) {
    * Einheit steht deshalb als eigene Option da und ist gewaehlt. */
   const orphanUnit = row?.unit && !metric.units.includes(row.unit) ? row.unit : null;
   const unitOptions = orphanUnit ? [orphanUnit, ...metric.units] : metric.units;
-  const unitField = vitalUnitEditable(metric)
-    ? `
-      <div class="form-field">
-        <label class="label" for="vital-unit">${esc(t('health.vitals.field.unit'))}</label>
-        <select class="input" id="vital-unit">
+  // WERT UND EINHEIT SIND EIN FELD: die Einheit steht als Suffix hinter der
+  // Zahl - als randlose Auswahl, wo es mehrere gibt (kg / lb), sonst als Text.
+  // Das versteckte Einheitenfeld bleibt, wo die Metrik nur eine fuehrt:
+  // collectVitalBody() liest `#vital-unit` in beiden Faellen.
+  const unitChoice = vitalUnitEditable(metric);
+  const unitControl = unitChoice
+    ? `<select class="form-input" id="vital-unit" aria-label="${esc(t('health.vitals.field.unit'))}">
           ${unitOptions.map((u) => `<option value="${esc(u)}"${row?.unit === u ? ' selected' : ''}>${esc(u)}</option>`).join('')}
-        </select>
-      </div>`
-    : `<input type="hidden" id="vital-unit" value="${esc(metric.units[0])}">`;
-  return `
-    <div class="modal-grid modal-grid--2">
-      <div class="form-field">
-        <label class="label" for="vital-value">${esc(t('health.vitals.field.value'))}</label>
-        <input class="input" id="vital-value" type="number" inputmode="decimal" step="any" required${valueAttr(row?.value_num)}>
-      </div>
-      ${unitField}
-    </div>`;
+        </select>`
+    : '';
+  const staticUnit = !unitChoice && metric.units[0] ? metric.units[0] : '';
+  const valueInput = `<input class="form-input form-composite__part form-composite__part--wide" id="vital-value" type="number" inputmode="decimal" step="any" required${staticUnit ? ' aria-describedby="vital-value-unit"' : ''}${valueAttr(row?.value_num)}>`;
+  return `${formRowHtml({
+    label: t(metric.labelKey),
+    labelFor: 'vital-value', labelExtra: REQUIRED_MARK,
+    field: true,
+    control: `<span class="form-composite">${valueInput}${unitControl}${staticUnit ? `<span class="form-composite__unit" id="vital-value-unit">${esc(staticUnit)}</span>` : ''}</span>`,
+  })}${unitChoice ? '' : `<input type="hidden" id="vital-unit" value="${esc(metric.units[0])}">`}`;
 }
 
 /**
@@ -2053,7 +2263,7 @@ function openVitalModal(opts = {}) {
   const visibilityValue = isEdit ? (row.visibility || 'private') : defaultVisibility(vitalScopeKey(currentType));
   const measuredValue = isEdit && row.measured_at
     ? String(row.measured_at).slice(0, 16)
-    : localDateTimeValue(now);
+    : nowDateTimeValue(now);
 
   openModal({
     title: isEdit ? t('health.vitals.edit') : t('health.vitals.add'),
@@ -2063,27 +2273,37 @@ function openVitalModal(opts = {}) {
     onClose: opts.onClose,
     content: `
       <form id="vital-form" class="form-stack">
-        <div class="form-field">
-          <label class="label" for="vital-type">${esc(t('health.vitals.field.type'))}</label>
-          <select class="input" id="vital-type"${isEdit ? ' disabled' : ''}>${typeOptions}</select>
-        </div>
-        <div id="vital-value-fields">${valueFieldsMarkup(currentType, row)}</div>
-        <div class="modal-grid modal-grid--2">
-          <div class="form-field">
-            <label class="label" for="vital-measured-at">${esc(t('health.vitals.field.measuredAt'))}</label>
-            <yuvomi-datepicker id="vital-measured-at" type="datetime" value="${esc(measuredValue)}"></yuvomi-datepicker>
-          </div>
-          <div class="form-field">
-            <label class="label" for="vital-visibility">${esc(t('health.vitals.field.visibility'))}</label>
-            <select class="input" id="vital-visibility">
+        ${/* GRUPPIERTE ZEILEN (R18, 2026-10-07, utils/form-row.js): Etikett
+             links, Wert rechts. Reihenfolge, ids und Verhalten der Felder
+             sind die alten - Art, Wert, Zeitpunkt, Sichtbarkeit, Notiz. Die
+             Notiz bleibt ein freies Feld ohne Zeilenraster. */ ''}
+        ${formRowsHtml(formRowHtml({
+          label: t('health.vitals.field.type'),
+          labelFor: 'vital-type',
+          control: `<select class="form-input" id="vital-type"${isEdit ? ' disabled' : ''}>${typeOptions}</select>`,
+        }))}
+        <div class="form-rows" id="vital-value-fields">${valueFieldsMarkup(currentType, row)}</div>
+        <p class="form-hint form-hint--warning" id="vital-plausibility" role="status" hidden></p>
+        ${formRowsHtml([
+          formRowHtml({
+            label: t('health.vitals.field.measuredAt'),
+            labelFor: 'vital-measured-at',
+            wide: true,
+            field: true,
+            control: `<yuvomi-datepicker id="vital-measured-at" type="datetime" value="${esc(measuredValue)}"></yuvomi-datepicker>`,
+          }),
+          formRowHtml({
+            label: t('health.vitals.field.visibility'),
+            labelFor: 'vital-visibility',
+            control: `<select class="form-input" id="vital-visibility">
               <option value="private"${visibilityValue === 'family' ? '' : ' selected'}>${esc(t('health.vitals.visibility.private'))}</option>
               <option value="family"${visibilityValue === 'family' ? ' selected' : ''}>${esc(t('health.vitals.visibility.family'))}</option>
-            </select>
-          </div>
-        </div>
+            </select>`,
+          }),
+        ])}
         <div class="form-field">
-          <label class="label" for="vital-note">${esc(t('health.vitals.field.note'))}</label>
-          <textarea class="input" id="vital-note" rows="2" maxlength="2000">${esc(isEdit && row.note ? row.note : '')}</textarea>
+          <label class="form-label" for="vital-note">${esc(t('health.vitals.field.note'))}</label>
+          <textarea class="form-input" id="vital-note" rows="2" maxlength="2000">${esc(isEdit && row.note ? row.note : '')}</textarea>
         </div>
         ${disclaimerMarkup(true)}
         <div class="modal-panel__footer modal-panel__footer--plain">
@@ -2116,10 +2336,45 @@ function openVitalModal(opts = {}) {
       let visibilityTouched = isEdit;
       visibilitySelect?.addEventListener('change', () => { visibilityTouched = true; });
 
+      // Weicher Hinweis (Critique R19): ungewoehnlich, aber speicherbar -
+      // 650 kg statt 65 kg faellt auf, bevor gespeichert ist.
+      //
+      // ERST NACH DEM EINGEBEN, NICHT WAEHREND (R19 Nachlese, Guide
+      // validate-input-after-interaction): auf `input` stand bei "37,5 °C"
+      // nach der ersten Ziffer "Dieser Wert ist nicht moeglich" da, und die
+      // Status-Region sagte jeden Zwischenstand an. Gezeigt wird beim
+      // Abschluss des Feldes (`change`: Verlassen oder Enter); beim Tippen
+      // geht der Hinweis nur weg, sobald der Wert stimmt.
+      const plausibilityHint = panel.querySelector('#vital-plausibility');
+      const typeNow = () => (isEdit ? row.type : typeSelect.value);
+      // EINE MELDUNG, NICHT ZWEI (Re-Kritik 2026-10-17): nach dem Speichern
+      // stand der harte Fehler rot am Feld UND derselbe Satz in Bernstein
+      // unter dem Puls. Solange ein Feld seinen Fehler selbst traegt
+      // (aria-invalid, reportFieldErrors), schweigt der Hinweis zu Hartem;
+      // Ungewoehnliches sagt er weiter.
+      const fieldCarriesError = () => Boolean(fieldsHost.querySelector('[aria-invalid="true"]'));
+      const updatePlausibility = () => {
+        const values = readVitalValues(panel, typeNow());
+        const text = vitalPlausibility(values).hard.length && fieldCarriesError() ? null : vitalPlausibilityText(values);
+        if (!plausibilityHint) return;
+        plausibilityHint.textContent = text ?? '';
+        plausibilityHint.hidden = !text;
+      };
+      const clearPlausibilityWhenResolved = () => {
+        if (plausibilityHint && !vitalPlausibilityText(readVitalValues(panel, typeNow()))) {
+          plausibilityHint.textContent = '';
+          plausibilityHint.hidden = true;
+        }
+      };
+      fieldsHost.addEventListener('input', clearPlausibilityWhenResolved);
+      fieldsHost.addEventListener('change', updatePlausibility);
+      updatePlausibility();
+
       typeSelect.addEventListener('change', () => {
         fieldsHost.replaceChildren();
         fieldsHost.insertAdjacentHTML('beforeend', valueFieldsMarkup(typeSelect.value));
         paintFields();
+        updatePlausibility();
         if (!visibilityTouched && visibilitySelect) {
           visibilitySelect.value = defaultVisibility(vitalScopeKey(typeSelect.value));
         }
@@ -2159,6 +2414,16 @@ function openVitalModal(opts = {}) {
           );
           return;
         }
+        // Unmoegliches gar nicht erst senden (Critique R19): dieselben harten
+        // Grenzen wie am Server, der Fehler steht am Feld, das ihn traegt.
+        if (reportFieldErrors(vitalPlausibility(body).hard.map(({ channel, issue }) => [
+          fieldsHost.querySelector(VITAL_CHANNEL_INPUT[channel]),
+          t(issue === 'bpOrder' ? 'health.errorVitalBpOrder' : 'health.errorVitalImpossible'),
+        ]))) {
+          submitBtn.disabled = false;
+          updatePlausibility();
+          return;
+        }
         submitBtn.disabled = true;
         try {
           if (isEdit) {
@@ -2177,7 +2442,7 @@ function openVitalModal(opts = {}) {
         } catch (err) {
           console.error('[Health] vitals save error:', err);
           submitBtn.disabled = false;
-          window.yuvomi?.showToast(err?.data?.error || t('health.vitals.saveError'), 'danger');
+          reportError(err, 'health.vitals.saveError', reloadVitals);
         }
       });
     },
@@ -2209,6 +2474,38 @@ function vitalPatchBody(body, { unitEditable = false, unitBefore } = {}) {
 function vitalUnitEditable(metric) {
   if (!metric || ['duration', 'scale', 'pair'].includes(metric.format)) return false;
   return (metric.units?.length ?? 0) > 1;
+}
+
+/** Kanal der Plausibilitaet -> Eingabefeld im Vitalwerte-Dialog. */
+const VITAL_CHANNEL_INPUT = Object.freeze({
+  value: '#vital-value', sys: '#vital-sys', dia: '#vital-dia', pulse: '#vital-pulse',
+});
+
+/**
+ * Die Zahlen, die gerade im Dialog stehen - auch halb ausgefuellt, fuer den
+ * Hinweis beim Tippen. Leere oder unlesbare Felder sind null.
+ */
+function readVitalValues(panel, type) {
+  const num = (selector) => {
+    const n = numOrNull(panel.querySelector(selector));
+    return Number.isFinite(n) ? n : null;
+  };
+  const metric = vitalMetric(type);
+  if (metric?.format === 'pair') {
+    return { type, unit: 'mmHg', value_num: num('#vital-sys'), value_num2: num('#vital-dia'), value_num3: num('#vital-pulse') };
+  }
+  return { type, unit: panel.querySelector('#vital-unit')?.value, value_num: num('#vital-value') };
+}
+
+/**
+ * Der eine Satz unter den Wertefeldern, oder null: zuerst Unmoegliches (das
+ * dann auch das Speichern anhaelt), sonst Ungewoehnliches (das nur nachfragt).
+ */
+function vitalPlausibilityText(values) {
+  const { hard, soft } = vitalPlausibility(values);
+  if (hard.length) return t(hard[0].issue === 'bpOrder' ? 'health.errorVitalBpOrder' : 'health.errorVitalImpossible');
+  if (soft.length) return t(soft[0].issue === 'high' ? 'health.vitals.unusualHigh' : 'health.vitals.unusualLow');
+  return null;
 }
 
 function numOrNull(input) {
@@ -2264,6 +2561,91 @@ function collectVitalBody(panel, type) {
     body.unit = panel.querySelector('#vital-unit')?.value || undefined;
   }
   return body;
+}
+
+/**
+ * EIN WEG FUER DIE FEHLER-TOASTS DER SEITE (#1909).
+ *
+ * Der Toast sagt den Satz der App (`errorSentence`): den des Falls, den der
+ * Server mit `reason` nennt, sonst den allgemeinen der Stelle. Der Text des
+ * Servers kommt hier nie an. Sagt der Grund, dass es das Ziel der Handlung
+ * nicht mehr gibt (ein anderes Haushaltsmitglied hat den Eintrag geloescht,
+ * oder die Betreuung wurde entzogen), ist der Stand der Seite veraltet: ein
+ * offener Dialog geht zu, und `reload` holt den Bereich selbst neu, statt dazu
+ * zu raten.
+ *
+ * @param {unknown} err
+ * @param {string} fallbackKey - der allgemeine Satz der Stelle
+ * @param {() => Promise<void>} reload - laedt den betroffenen Bereich neu
+ */
+function reportError(err, fallbackKey, reload, { fromDialog = true } = {}) {
+  window.yuvomi?.showToast(errorSentence(err, fallbackKey), 'danger');
+  if (!isGone(err)) return;
+  // Eine Handlung ohne Dialog (Dosis abhaken, Periode heute) laesst die Seite
+  // bedienbar: ein Dialog, der offen ist, wenn ihre Antwort kommt, gehoert zu
+  // einer spaeteren Handlung und bleibt (Codex an #1971).
+  if (fromDialog) reloadAfterGone(reload);
+  else refreshAfterGone(reload);
+}
+
+/**
+ * Nachladen nach "gibt es nicht mehr". Die reload-Wege melden ihre eigenen
+ * Fehler im Bereich (Ladefehler-Zustand), nie ueber reportError - ein
+ * scheiterndes Nachladen kann also kein weiteres ausloesen.
+ */
+async function reloadAfterGone(reload) {
+  await closeModal({ force: true });
+  await loadCareGrants();
+  await reload();
+  refocusAfterRender();
+}
+
+/**
+ * Der frische Stand nach "gibt es nicht mehr", ohne einen Dialog anzufassen
+ * (derselbe Weg wie in reloadAfterGone, dort ausgeschrieben fuer den Fokus-Guard).
+ * Die Betreuungen kommen mit (Codex an #1971): die 404 kann auch heissen,
+ * dass die Betreuung fuer diese Person entzogen wurde, und `careFor` stammt
+ * sonst vom ersten Aufbau der Seite - die Knoepfe boten das Schreiben weiter an.
+ * `loadCareGrants` meldet nichts und faellt im Zweifel auf "keine Betreuung".
+ */
+async function refreshAfterGone(reload) {
+  await loadCareGrants();
+  await reload();
+}
+
+/**
+ * LOESCHEN AUF ETWAS, DAS "NICHT GEFUNDEN" WIRD, IST HIER KEIN ERFOLG (#1909).
+ * Anders als in Einkauf und Abfuhr sagt die 404 der Gesundheit zweierlei:
+ * geloescht, ODER die Betreuung fuer diese Person wurde entzogen und die Zeile
+ * steht noch. Ein "geloescht" waere im zweiten Fall falsch. Deshalb laeuft ein
+ * Loeschen mit diesem Grund wie jede andere Handlung durch reportError: der
+ * Satz, und der Bereich kommt frisch vom Server, der zeigt, was wirklich steht.
+ *
+ * Fuer die Loeschwege mit Ruecknahme-Toast (Messwert, Vorsorge, Naehrwerte):
+ * scheitert das Loeschen nach Ablauf der Frist an "gibt es nicht mehr", wird
+ * nicht die alte Zeile zurueckgestellt, sondern nachgeladen.
+ */
+function restoreOrReload(err, fallbackKey, reload, restore) {
+  if (err && isGone(err)) {
+    // Das Loeschen laeuft erst nach der Ruecknahmefrist; ein Dialog, der jetzt
+    // offen ist, gehoert zu einer spaeteren Handlung und bleibt (Codex an #1971).
+    window.yuvomi?.showToast(errorSentence(err, fallbackKey), 'danger');
+    refreshAfterGone(reload);
+    return;
+  }
+  restore();
+}
+
+/** Werte-Tab neu laden, ohne gewaehlte Metrik und Zeitraum zu verstellen. */
+async function reloadVitals() {
+  try {
+    await loadVitals();
+    vitals.error = false;
+  } catch (err) {
+    console.error('[Health] vitals reload error:', err);
+    vitals.error = err;
+  }
+  renderVitalsShell();
 }
 
 async function reloadAfterSave(savedType) {
@@ -2415,7 +2797,7 @@ function maybeMountMeds(activeRoute) {
 async function mountMeds() {
   meds.root.replaceChildren();
   meds.root.insertAdjacentHTML('beforeend',
-    `<div class="health-meds__loading">${esc(t('common.loading'))}</div>`);
+    areaLoadingMarkup('meds', 'list'));
 
   try {
     await loadHealthMembers(meds, healthUser);
@@ -2465,8 +2847,11 @@ function medLogWindowDays(med, baseDays) {
   return Math.max(baseDays, Math.ceil(hours / 24) + 1);
 }
 
+// Nur die Plaene der Medikamente, die heute zaehlen (#1950): die Regel selbst
+// steht in `utils/health-meds.js`, die Uebersicht liest sie ueber
+// `overviewAllSchedules()` genauso.
 function allSchedules() {
-  return meds.list.flatMap((m) => meds.schedulesByMed[m.id] || []);
+  return currentSchedules(meds.list, meds.schedulesByMed);
 }
 
 /**
@@ -2477,10 +2862,16 @@ function allSchedules() {
  * mit #700: vorher fielen Bedarfsdosen schon am Zeitraumfilter der Route heraus,
  * seit dem Fix kommen sie mit - und drei von sieben geplanten Dosen plus acht
  * Kopfschmerztabletten haetten „100 %, 11 von 11" ergeben.
+ *
+ * Und nur die Dosen der Medikamente, deren Plaene im Nenner stehen (#1950):
+ * `allSchedules()` laesst ein abgeschaltetes Medikament aus, also darf seine
+ * frueher genommene Dosis nicht im Zaehler stehen - sonst deckt sie eine
+ * ausgelassene Dosis eines anderen Medikaments. Das Einnahmeprotokoll
+ * (`medLogHistoryMarkup`) zeigt sie weiter.
  */
 function allLogsInRange(from, to) {
   const out = [];
-  for (const m of meds.list) {
+  for (const m of meds.list.filter(medicationCountsToday)) {
     for (const l of scheduledLogs(meds.logsByMed[m.id])) {
       const key = String(l.scheduled_at || l.taken_at || l.created_at || '').slice(0, 10);
       if (key >= from && key <= to) out.push(l);
@@ -2615,7 +3006,7 @@ function prnScope(scope) {
 
 /** Die aktiven Bedarfsmedikamente eines Tabs. */
 function prnMeds(scope) {
-  return prnScope(scope).list.filter((m) => m.prn && m.active);
+  return prnScope(scope).list.filter((m) => m.prn && medicationCountsToday(m));
 }
 
 /** Zeitpunkt lesbar: die Uhrzeit allein nur, wenn sie noch heute liegt. */
@@ -2825,7 +3216,7 @@ async function handlePrnDose(btn) {
   } catch (err) {
     console.error('[Health] prn dose error:', err);
     setDoseBusy(medId, false);
-    window.yuvomi?.showToast(err?.data?.error || t('health.meds.doseError'), 'danger');
+    reportError(err, 'health.meds.doseError', reloadMedViews, { fromDialog: false });
     return;
   }
 
@@ -3001,7 +3392,10 @@ function medLogHistoryMarkup() {
   }).join('');
   return `
     <details class="health-medlog">
-      <summary>${esc(t('health.meds.logTitle'))}</summary>
+      <summary>
+        <span>${esc(t('health.meds.logTitle'))}</span>
+        <i data-lucide="chevron-down" class="health-medlog__chevron" aria-hidden="true"></i>
+      </summary>
       <ul class="health-medlog__list">${rows}</ul>
     </details>`;
 }
@@ -3106,7 +3500,7 @@ function openMedLogModal(logId) {
         } catch (err) {
           console.error('[Health] med log save error:', err);
           submitBtn.disabled = false;
-          window.yuvomi?.showToast(err?.data?.error || t('health.meds.log.saveError'), 'danger');
+          reportError(err, 'health.meds.log.saveError', reloadMedViews);
         }
       });
     },
@@ -3124,7 +3518,7 @@ async function deleteMedLog(entry) {
     refocusAfterRender();
   } catch (err) {
     console.error('[Health] med log delete error:', err);
-    window.yuvomi?.showToast(err?.data?.error || t('health.meds.log.saveError'), 'danger');
+    reportError(err, 'health.meds.log.saveError', reloadMedViews);
   }
 }
 
@@ -3274,7 +3668,7 @@ async function handleDose(btn, action) {
   } catch (err) {
     console.error('[Health] dose error:', err);
     setDoseBusy(medId, false);
-    window.yuvomi?.showToast(err?.data?.error || t('health.meds.doseError'), 'danger');
+    reportError(err, 'health.meds.doseError', reloadMedViews, { fromDialog: false });
   }
 }
 
@@ -3286,6 +3680,25 @@ function openMedModal(med) {
   if (readOnly()) return;  // #1265, dritte Linie: auch ein Aufruf ohne Knopf endet hier
   const isEdit = Boolean(med && med.id);
   const val = (v) => (v == null ? '' : String(v));
+  // EIN SCHRITT STATT ZWEIEN (R20, Re-Critique 2026-10-17 a5 P2-8): ein neues
+  // Medikament bekam seinen Einnahmeplan erst nach dem Speichern ("Speichere
+  // das Medikament, dann ..."), also Dialog zu, Zeile suchen, Dialog wieder
+  // auf. Jetzt sammelt der Editor die Zeitfenster eines NEUEN Medikaments als
+  // Entwurf, und das Speichern legt sie gleich danach an. Beim Bearbeiten
+  // bleibt es wie zuvor: jedes Zeitfenster speichert sofort.
+  const draft = isEdit ? null : [];
+  // Ein neues Medikament, das schon angelegt ist, waehrend ein Zeitfenster
+  // danach scheiterte: der naechste Versuch aendert es statt es zu verdoppeln.
+  // Ein schon gespeichertes Zeitfenster traegt seine Server-id im Entwurf
+  // (`savedId`, siehe wireSchedEditor): Loeschen trifft dann auch den Server.
+  let createdId = null;
+  // BESTAND UND NOTIZ HINTER "WEITERE EINSTELLUNGEN" (dieselbe Re-Critique):
+  // der Dialog mass mobil 1082px, die drei Bestandsfelder standen auch fuer
+  // ein Medikament offen, dessen Packung niemand zaehlt. Hat es einen Bestand
+  // oder eine Notiz, steht der Aufklapper offen - nichts Gespeichertes
+  // verschwindet hinter einem geschlossenen.
+  const moreOpen = [med?.stock_qty, med?.stock_unit, med?.refill_threshold, med?.note]
+    .some((v) => v != null && String(v).trim() !== '');
 
   openModal({
     title: isEdit ? t('health.meds.edit') : t('health.meds.add'),
@@ -3293,10 +3706,12 @@ function openMedModal(med) {
     content: `
       <form id="med-form" class="form-stack">
         <div class="form-field">
-          <label class="label" for="med-name">${esc(t('health.meds.field.name'))}</label>
+          <label class="label" for="med-name">${esc(t('health.meds.field.name'))}${REQUIRED_MARK}</label>
           <input class="input" id="med-name" type="text" maxlength="200" required value="${esc(val(med?.name))}">
         </div>
-        <div class="modal-grid modal-grid--2">
+        ${/* Paare teilen sich die Zeile auch im 390er-Blatt (.form-pair,
+             layout.css): Dosis/Form und Uhrzeit/Dosis sind kurze Werte. */ ''}
+        <div class="form-pair">
           <div class="form-field">
             <label class="label" for="med-dosage">${esc(t('health.meds.field.dosageText'))}</label>
             <input class="input" id="med-dosage" type="text" maxlength="100" value="${esc(val(med?.dosage_text))}">
@@ -3306,30 +3721,10 @@ function openMedModal(med) {
             <input class="input" id="med-form-field" type="text" maxlength="30" value="${esc(val(med?.form))}">
           </div>
         </div>
-        <div class="modal-grid modal-grid--3">
-          <div class="form-field">
-            <label class="label" for="med-stock">${esc(t('health.meds.field.stockQty'))}</label>
-            <input class="input" id="med-stock" type="number" inputmode="decimal" step="any" min="0" value="${esc(val(med?.stock_qty))}">
-          </div>
-          <div class="form-field">
-            <label class="label" for="med-stock-unit">${esc(t('health.meds.field.stockUnit'))}</label>
-            <input class="input" id="med-stock-unit" type="text" maxlength="30" value="${esc(val(med?.stock_unit))}">
-          </div>
-          <div class="form-field">
-            <label class="label" for="med-refill">${esc(t('health.meds.field.refillThreshold'))}</label>
-            <input class="input" id="med-refill" type="number" inputmode="decimal" step="any" min="0" value="${esc(val(med?.refill_threshold))}">
-          </div>
-        </div>
-        <div class="modal-grid modal-grid--2">
-          <label class="health-check">
-            <input type="checkbox" id="med-active" ${med == null || med.active ? 'checked' : ''}>
-            <span>${esc(t('health.meds.field.active'))}</span>
-          </label>
-          <label class="health-check">
-            <input type="checkbox" id="med-prn" ${med?.prn ? 'checked' : ''}>
-            <span>${esc(t('health.meds.field.prn'))}</span>
-          </label>
-        </div>
+        ${formRowsHtml([
+          toggleRowHtml({ label: t('health.meds.field.active'), control: 'switch', checked: med == null || Boolean(med.active), attrs: { id: 'med-active' } }),
+          toggleRowHtml({ label: t('health.meds.field.prn'), control: 'switch', checked: Boolean(med?.prn), attrs: { id: 'med-prn' } }),
+        ])}
         <!-- Nur fuer Bedarfsmedikamente sichtbar (#700): ein Mindestabstand an
              einem Medikament mit Zeitplan waere eine zweite, widersprechende
              Auskunft darueber, wann die naechste Dosis ansteht. -->
@@ -3353,6 +3748,12 @@ function openMedModal(med) {
             <p class="form-hint">${esc(t('health.meds.field.prnDoseHint'))}</p>
           </div>
         </div>
+
+        <div class="health-sched">
+          <span class="label">${esc(t('health.meds.schedule.title'))}</span>
+          <div id="med-sched-editor"></div>
+        </div>
+
         <div class="form-field">
           <label class="label" for="med-visibility">${esc(t('health.meds.field.visibility'))}</label>
           <select class="input" id="med-visibility">
@@ -3360,15 +3761,26 @@ function openMedModal(med) {
             <option value="family" ${(med?.visibility || defaultVisibility('meds')) === 'family' ? 'selected' : ''}>${esc(t('health.meds.visibility.family'))}</option>
           </select>
         </div>
+
+        ${advancedSection(`
+        <div class="modal-grid modal-grid--3">
+          <div class="form-field">
+            <label class="label" for="med-stock">${esc(t('health.meds.field.stockQty'))}</label>
+            <input class="input" id="med-stock" type="number" inputmode="decimal" step="any" min="0" value="${esc(val(med?.stock_qty))}">
+          </div>
+          <div class="form-field">
+            <label class="label" for="med-stock-unit">${esc(t('health.meds.field.stockUnit'))}</label>
+            <input class="input" id="med-stock-unit" type="text" maxlength="30" value="${esc(val(med?.stock_unit))}">
+          </div>
+          <div class="form-field">
+            <label class="label" for="med-refill">${esc(t('health.meds.field.refillThreshold'))}</label>
+            <input class="input" id="med-refill" type="number" inputmode="decimal" step="any" min="0" value="${esc(val(med?.refill_threshold))}">
+          </div>
+        </div>
         <div class="form-field">
           <label class="label" for="med-note">${esc(t('health.meds.field.note'))}</label>
           <textarea class="input" id="med-note" rows="2" maxlength="5000">${esc(val(med?.note))}</textarea>
-        </div>
-
-        <div class="health-sched">
-          <span class="label">${esc(t('health.meds.schedule.title'))}</span>
-          <div id="med-sched-editor"></div>
-        </div>
+        </div>`, { open: moreOpen })}
 
         <div class="modal-panel__footer modal-panel__footer--plain">
           ${isEdit ? `<button type="button" class="btn btn--danger-outline" data-action="med-delete" style="margin-inline-end:auto"><i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${esc(t('common.delete'))}</button>` : ''}
@@ -3377,7 +3789,7 @@ function openMedModal(med) {
         </div>
       </form>`,
     onSave(panel) {
-      renderSchedEditor(panel, med);
+      renderSchedEditor(panel, med, draft);
       if (window.lucide) window.lucide.createIcons({ el: panel });
 
       // Die Bedarfsfelder folgen dem Haken - `style.display` und nicht `hidden`,
@@ -3403,7 +3815,28 @@ function openMedModal(med) {
         submitBtn.disabled = true;
         try {
           if (isEdit) await api.patch(`/health/medications/${med.id}`, body);
-          else await api.post('/health/medications', { ...body, ...ownerField(meds.personId, meds.meId) });
+          else {
+            // Die Zeitfenster des Entwurfs nach dem Medikament: es gibt sie
+            // erst mit seiner id. Scheitert eines, steht das Medikament schon
+            // und der Dialog bleibt offen. Der naechste Versuch legt es darum
+            // NICHT noch einmal an, sondern aendert das schon angelegte
+            // (`createdId`), und schickt nur die Zeitfenster, die noch fehlen
+            // (ohne `savedId`) - sonst entstuenden Medikament und Plan doppelt.
+            if (createdId == null) {
+              const created = await api.post('/health/medications', { ...body, ...ownerField(meds.personId, meds.meId) });
+              createdId = created?.data?.id ?? null;
+            } else {
+              await api.patch(`/health/medications/${createdId}`, body);
+            }
+            if (createdId != null) {
+              for (const sched of draft) {
+                if (sched.savedId != null) continue;
+                const res = await api.post(`/health/medications/${createdId}/schedules`, sched);
+                // Nicht enumerierbar: es reist nie in einen Request-Body.
+                Object.defineProperty(sched, 'savedId', { value: res?.data?.id ?? null, writable: true });
+              }
+            }
+          }
           closeModal({ force: true });
           window.yuvomi?.showToast(t('health.meds.saved'), 'success');
           await reloadMedViews();
@@ -3411,7 +3844,7 @@ function openMedModal(med) {
         } catch (err) {
           console.error('[Health] med save error:', err);
           submitBtn.disabled = false;
-          window.yuvomi?.showToast(err?.data?.error || t('health.meds.saveError'), 'danger');
+          reportError(err, 'health.meds.saveError', reloadMedViews);
         }
       });
     },
@@ -3460,24 +3893,23 @@ async function deleteMed(med) {
     refocusAfterRender();
   } catch (err) {
     console.error('[Health] med delete error:', err);
-    window.yuvomi?.showToast(err?.data?.error || t('health.meds.deleteError'), 'danger');
+    reportError(err, 'health.meds.deleteError', reloadMedViews);
   }
 }
 
 // Zeichnet den Einnahmeplan-Editor im Modal (Liste + Hinzufügen-Formular) und
-// verdrahtet ihn. Für ein noch nicht gespeichertes Medikament nur ein Hinweis.
-function renderSchedEditor(panel, med) {
+// verdrahtet ihn. Für ein noch nicht gespeichertes Medikament arbeitet er auf
+// dem Entwurf (`draft`), den das Speichern des Medikaments anlegt (R20).
+function renderSchedEditor(panel, med, draft = null) {
   const host = panel.querySelector('#med-sched-editor');
   if (!host) return;
   host.replaceChildren();
 
-  if (!med || !med.id) {
-    host.insertAdjacentHTML('beforeend',
-      `<div class="health-sched-hint">${esc(t('health.meds.schedule.newHint'))}</div>`);
-    return;
-  }
-
-  const schedules = meds.schedulesByMed[med.id] || [];
+  const isDraft = !med?.id;
+  // Ein Entwurf hat noch keine id; die Zeile braucht eine zum Loeschen.
+  const schedules = isDraft
+    ? (draft || []).map((s, i) => ({ ...s, id: `draft-${i}` }))
+    : (meds.schedulesByMed[med.id] || []);
   const list = schedules.length
     ? `<ul class="health-sched-list">${schedules.map(schedRowMarkup).join('')}</ul>`
     : `<div class="health-sched-empty">${esc(t('health.meds.schedule.none'))}</div>`;
@@ -3485,7 +3917,7 @@ function renderSchedEditor(panel, med) {
   host.insertAdjacentHTML('beforeend', `
     ${list}
     <div class="health-sched-add">
-      <div class="modal-grid modal-grid--2">
+      <div class="form-pair">
         <div class="form-field">
           <label class="label" for="sched-time">${esc(t('health.meds.schedule.time'))}</label>
           <yuvomi-datepicker id="sched-time" type="time" value="08:00"></yuvomi-datepicker>
@@ -3507,7 +3939,7 @@ function renderSchedEditor(panel, med) {
       </button>
     </div>`);
   if (window.lucide) window.lucide.createIcons({ el: host });
-  wireSchedEditor(panel, med);
+  wireSchedEditor(panel, med, draft);
 }
 
 function schedRowMarkup(s) {
@@ -3524,8 +3956,9 @@ function schedRowMarkup(s) {
     </li>`;
 }
 
-function wireSchedEditor(panel, med) {
+function wireSchedEditor(panel, med, draft = null) {
   const host = panel.querySelector('#med-sched-editor');
+  const isDraft = !med?.id;
 
   host.querySelectorAll('.health-weekday').forEach((btn) =>
     btn.addEventListener('click', () => {
@@ -3546,6 +3979,11 @@ function wireSchedEditor(panel, med) {
     const body = { time_of_day: time, days_mask: indicesToDaysMask(indices) };
     if (doseRaw !== '' && doseRaw != null) body.dose_qty = Number(doseRaw);
 
+    if (isDraft) {
+      draft.push(body);
+      renderSchedEditor(panel, med, draft);
+      return;
+    }
     addBtn.disabled = true;
     try {
       const res = await api.post(`/health/medications/${med.id}/schedules`, body);
@@ -3555,12 +3993,33 @@ function wireSchedEditor(panel, med) {
     } catch (err) {
       console.error('[Health] schedule add error:', err);
       addBtn.disabled = false;
-      window.yuvomi?.showToast(err?.data?.error || t('health.meds.saveError'), 'danger');
+      reportError(err, 'health.meds.saveError', reloadMedViews);
     }
   });
 
   host.querySelectorAll('[data-sched-del]').forEach((btn) =>
     btn.addEventListener('click', async () => {
+      if (isDraft) {
+        const index = Number(String(btn.dataset.schedDel).replace('draft-', ''));
+        const saved = draft[index]?.savedId;
+        // Ein Teil-Speichern hat dieses Zeitfenster schon angelegt: es nur aus
+        // dem Entwurf zu nehmen liesse es am Medikament stehen, und der
+        // naechste Versuch ueberspraenge es.
+        if (saved != null) {
+          btn.disabled = true;
+          try {
+            await api.delete(`/health/schedules/${saved}`);
+          } catch (err) {
+            console.error('[Health] schedule delete error:', err);
+            btn.disabled = false;
+            reportError(err, 'health.meds.saveError', reloadMedViews);
+            return;
+          }
+        }
+        draft.splice(index, 1);
+        renderSchedEditor(panel, med, draft);
+        return;
+      }
       const id = Number(btn.dataset.schedDel);
       btn.disabled = true;
       try {
@@ -3570,7 +4029,7 @@ function wireSchedEditor(panel, med) {
       } catch (err) {
         console.error('[Health] schedule delete error:', err);
         btn.disabled = false;
-        window.yuvomi?.showToast(err?.data?.error || t('health.meds.saveError'), 'danger');
+        reportError(err, 'health.meds.saveError', reloadMedViews);
       }
     }));
 }
@@ -3614,7 +4073,7 @@ function maybeMountLabs(activeRoute) {
 async function mountLabs() {
   labs.root.replaceChildren();
   labs.root.insertAdjacentHTML('beforeend',
-    `<div class="health-labs__loading">${esc(t('common.loading'))}</div>`);
+    areaLoadingMarkup('labs', 'list'));
 
   try {
     await loadHealthMembers(labs, healthUser);
@@ -3637,7 +4096,7 @@ async function loadLabs() {
     labs.selectedReportId = labs.reports[0]?.id ?? null;
   }
   const names = analyteNames(labs.reports);
-  if (!names.includes(labs.trendAnalyte)) labs.trendAnalyte = names[0] ?? null;
+  if (!names.includes(labs.trendAnalyte)) labs.trendAnalyte = defaultTrendAnalyte(labs.reports);
 }
 
 function selectedReport() {
@@ -3746,7 +4205,8 @@ function labDetailMarkup() {
           </thead>
           <tbody>${results.map(resultRowMarkup).join('')}</tbody>
         </table>
-      </div>`
+      </div>
+      ${resultListMarkup(results)}`
     : emptyHintHTML(t('health.labs.noAnalytes'));
 
   return `
@@ -3779,6 +4239,34 @@ function resultRowMarkup(r) {
     </tr>`;
 }
 
+/* LABORWERTE MOBIL ALS ZEILEN (Critique 2026-10-16). Unter 640px war der
+ * Befund eine Tabelle, die seitlich scrollte: Analyt, Wert und Referenz
+ * passten, die Bewertung („Niedrig") lag rechts ausserhalb des Bilds - genau
+ * die Angabe, fuer die man den Befund oeffnet. Mobil steht jeder Analyt jetzt
+ * als Zeile: links der Name, rechts der Wert, darunter Referenz und
+ * Bewertung als Text mit Pfeil. Auffaellige Werte (niedrig/hoch) stehen
+ * vorn, sonst bleibt die Reihenfolge des Befunds. Die Tabelle bleibt ab
+ * 640px; beide Fassungen stehen im Markup, CSS zeigt je Breite eine
+ * (`display: none` nimmt die andere auch aus dem Accessibility-Baum). */
+function resultListMarkup(results) {
+  const abnormal = (r) => r.flag === 'low' || r.flag === 'high';
+  const ordered = [...results.filter(abnormal), ...results.filter((r) => !abnormal(r))];
+  return `
+    <ul class="health-lab-rows">${ordered.map((r) => {
+    const unit = r.unit ? ` ${esc(r.unit)}` : '';
+    const refText = referenceLabel(r.ref_low, r.ref_high);
+    const ref = refText === '-' ? '' : `<span class="health-lab-rows__ref">${esc(t('health.labs.col.reference'))} ${esc(refText)}</span>`;
+    const flag = r.flag && LAB_FLAGS.includes(r.flag) ? flagIndicatorMarkup(r.flag) : '';
+    return `
+      <li class="health-lab-rows__row${abnormal(r) ? ` health-lab-rows__row--${esc(r.flag)}` : ''}">
+        <span class="health-lab-rows__analyte">${esc(r.analyte)}</span>
+        <span class="health-lab-rows__value">${esc(fmtNum(r.value_num))}${unit}</span>
+        ${ref || flag ? `<span class="health-lab-rows__meta">${ref}${flag}</span>` : ''}
+      </li>`;
+  }).join('')}
+    </ul>`;
+}
+
 function referenceLabel(refLow, refHigh) {
   const low = refLow == null ? null : fmtNum(refLow);
   const high = refHigh == null ? null : fmtNum(refHigh);
@@ -3806,7 +4294,7 @@ function flagIndicatorMarkup(flag) {
 function labTrendMarkup() {
   const names = analyteNames(labs.reports);
   if (names.length === 0) return '';
-  const selected = names.includes(labs.trendAnalyte) ? labs.trendAnalyte : names[0];
+  const selected = names.includes(labs.trendAnalyte) ? labs.trendAnalyte : defaultTrendAnalyte(labs.reports);
   const points = analyteTrend(labs.reports, selected);
 
   const options = names.map((n) =>
@@ -3914,9 +4402,11 @@ function labTrendChart(points, analyteName) {
     <svg class="chart health-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(ariaLabel)}">
       ${grid}
       ${band}
-      <polyline fill="none" stroke="var(--module-health)" stroke-width="2"
-        stroke-linejoin="round" stroke-linecap="round" points="${linePts}" />
-      ${dots}
+      <g class="health-chart__lines">
+        <polyline fill="none" stroke="var(--module-health)" stroke-width="2"
+          stroke-linejoin="round" stroke-linecap="round" points="${linePts}" />
+        ${dots}
+      </g>
       ${xLabels}
     </svg>
     ${table}
@@ -3931,6 +4421,7 @@ const FLAG_DOT_COLORS = {
 };
 
 function wireLabs() {
+  drawHealthCharts(labs.root, 'health-labs');
   wireTablistKeys(labs.root);
   installPopoverMenus(labs.root);
   wirePersonSwitcher(labs, switchLabsPerson);
@@ -3942,6 +4433,11 @@ function wireLabs() {
       if (id === labs.selectedReportId) return;
       labs.selectedReportId = id;
       renderLabsShell();
+      // DER FOKUS BLEIBT AUF DEM BEFUND (Re-Critique 2026-10-17, Persona Sam):
+      // der Neuaufbau tauschte die Liste aus, und der Fokus fiel auf BODY -
+      // der naechste Tab begann wieder oben auf der Seite. Die gewaehlte Karte
+      // steht im neuen Baum unter derselben ID.
+      labs.root.querySelector(`.health-lab-card[data-report-id="${id}"]`)?.focus({ preventScroll: true });
     }));
 
   // Kein `return` als Riegel: die Analyt-Auswahl darunter LIEST nur, und eine
@@ -3969,6 +4465,7 @@ function wireLabs() {
 
 // Verdrahtet nur die Detail-internen Steuerelemente neu (nach Trend-Wechsel).
 function wireLabsDetail() {
+  drawHealthCharts(labs.root, 'health-labs');
   if (!readOnly()) {
     labs.root.querySelector('[data-action="lab-edit"]')?.addEventListener('click', (e) => {
       const id = Number(e.currentTarget.dataset.reportId);
@@ -4070,7 +4567,7 @@ function openLabModal(report) {
         } catch (err) {
           console.error('[Health] lab save error:', err);
           submitBtn.disabled = false;
-          window.yuvomi?.showToast(err?.data?.error || t('health.labs.saveError'), 'danger');
+          reportError(err, 'health.labs.saveError', reloadLabs);
         }
       });
     },
@@ -4101,7 +4598,7 @@ async function deleteLabReport(report) {
     refocusAfterRender();
   } catch (err) {
     console.error('[Health] lab delete error:', err);
-    window.yuvomi?.showToast(err?.data?.error || t('health.labs.deleteError'), 'danger');
+    reportError(err, 'health.labs.deleteError', reloadLabs);
   }
 }
 
@@ -4272,7 +4769,7 @@ function wireResultEditor(panel, report, editing = null) {
     } catch (err) {
       console.error('[Health] lab result add error:', err);
       addBtn.disabled = false;
-      window.yuvomi?.showToast(err?.data?.error || t('health.labs.saveError'), 'danger');
+      reportError(err, 'health.labs.saveError', reloadLabs);
     }
   });
 
@@ -4288,7 +4785,7 @@ function wireResultEditor(panel, report, editing = null) {
       } catch (err) {
         console.error('[Health] lab result delete error:', err);
         btn.disabled = false;
-        window.yuvomi?.showToast(err?.data?.error || t('health.labs.saveError'), 'danger');
+        reportError(err, 'health.labs.saveError', reloadLabs);
       }
     }));
 }
@@ -4299,7 +4796,7 @@ function wireResultEditor(panel, report, editing = null) {
 // und Detail-Tabelle synchron.
 function syncLabsAfterResultChange() {
   const names = analyteNames(labs.reports);
-  if (!names.includes(labs.trendAnalyte)) labs.trendAnalyte = names[0] ?? null;
+  if (!names.includes(labs.trendAnalyte)) labs.trendAnalyte = defaultTrendAnalyte(labs.reports);
   renderLabsShell();
 }
 
@@ -4339,7 +4836,7 @@ function maybeMountActivity(activeRoute) {
 async function mountActivity() {
   activity.root.replaceChildren();
   activity.root.insertAdjacentHTML('beforeend',
-    `<div class="health-activity__loading">${esc(t('common.loading'))}</div>`);
+    areaLoadingMarkup('activity', 'chart'));
 
   try {
     await loadHealthMembers(activity, healthUser);
@@ -4433,6 +4930,7 @@ function renderActivityShell() {
     ${totals.count === 0 ? '' : `<div class="health-activity__log">${activityLogMarkup(weekRows)}</div>`}
   `);
   if (window.lucide) window.lucide.createIcons({ el: activity.root });
+  drawHealthCharts(activity.root, 'health-activity');
   wireActivity();
   refreshHealthFab();
 }
@@ -4462,28 +4960,48 @@ function activityChartMarkup(summary) {
     return emptyHintHTML(t('health.activity.noData'), { className: 'health-chart-empty' });
   }
 
-  const { W, H } = CHART;
-  const { left, right, top, bottom } = chartScales();
+  // MOBIL EINE HOEHERE FLAECHE MIT MEHR FUSS (Critique R18, 2026-10-07).
+  // Gemessen bei 390px: das Diagramm stand 324x96, und weil die Geometrie
+  // skaliert, die Achsenschrift aber nicht, war der Fuss (PAD_B = 26
+  // Einheiten) nur 14px hoch - die Wochentage standen 3px IN den Balkenfuessen
+  // und neben der "0" der Werteachse. Unter 640px rechnet das Diagramm auf
+  // 600x320 mit 44 Einheiten Fuss (24px bei 324px Breite): die Flaeche steht
+  // bei rund 170px, die Wochentage frei unter der Grundlinie.
+  const geo = activityChartGeometry();
+  const { W, H } = geo;
+  const { left, right, top, bottom } = chartScales(geo);
   const n = buckets.length;
   const chartH = bottom - top;
   const slot = (right - left) / n;
-  const barW = slot * 0.6;
-  // Runde Achse (C4): die Balken messen gegen die gerundete Obergrenze.
-  const { max, steps } = niceDomain(0, peak);
+  // SCHLANKE BALKEN (hoechstens ~24px am Bildschirm, der Rest der Spalte ist
+  // Luft): die Breite steht in viewBox-Einheiten und folgt deshalb der
+  // Geometrie - 40 Einheiten sind auf dem Telefon 22px, 18 am Desktop 22-26px.
+  const barW = Math.min(slot * 0.6, geo === ACTIVITY_CHART_NARROW ? 40 : 18);
+  // Ruhige Achse (R18): Grundlinie, Mitte, Obergrenze - die Werte stehen am
+  // heutigen Balken, in den Kacheln darueber und in der Tabelle.
+  const { max, steps } = calmDomain(peak, { integer: true });
+  const today = todayKey();
 
   const bars = buckets.map((b, i) => {
     const h = (b.durationMin / max) * chartH;
     const x = left + i * slot + (slot - barW) / 2;
     const y = bottom - h;
+    const isToday = b.date === today;
     const label = t(ACTIVITY_WEEKDAY_LABEL_KEYS[b.weekday ?? i]);
-    const rect = b.durationMin > 0
-      ? `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" rx="3" fill="var(--module-health)"><title>${esc(`${label}: ${t('health.activity.unit.min', { value: fmtNum(b.durationMin) })}`)}</title></rect>`
+    const minutes = t('health.activity.unit.min', { value: fmtNum(b.durationMin) });
+    const bar = b.durationMin > 0
+      ? `<path class="health-activity-chart__bar${isToday ? ' health-activity-chart__bar--today' : ''} chart__bar" d="${activityBarPath(x, y, barW, bottom)}"><title>${esc(`${label}: ${minutes}`)}</title></path>`
       : '';
-    return `${rect}
-      <text x="${(x + barW / 2).toFixed(1)}" y="${H - 8}" class="chart__axis" text-anchor="middle">${esc(label)}</text>`;
+    // Der Wert steht nur am heutigen Balken (R18): eine Zahl an jedem Balken
+    // waere eine zweite Achse; alle sieben stehen in der Tabelle darunter.
+    const value = isToday && b.durationMin > 0
+      ? `<text x="${(x + barW / 2).toFixed(1)}" y="${y.toFixed(1)}" dy="-0.5em" class="chart__axis health-activity-chart__value" text-anchor="middle">${esc(minutes)}</text>`
+      : '';
+    return `${bar}${value}
+      <text x="${(x + barW / 2).toFixed(1)}" y="${H - 8}" class="chart__axis${isToday ? ' health-activity-chart__day--today' : ''}" text-anchor="middle">${esc(label)}</text>`;
   }).join('');
 
-  const grid = chartGridFor(0, max, undefined, undefined, steps);
+  const grid = chartGridFor(0, max, undefined, geo, steps);
 
   const tableRows = buckets.map((b, i) => [
     t(ACTIVITY_WEEKDAY_LABEL_KEYS[b.weekday ?? i]),
@@ -4495,13 +5013,35 @@ function activityChartMarkup(summary) {
     tableRows,
   );
 
+  // `.chart` traegt 600 / 200 als Seitenverhaeltnis (panel.css); die hoehere
+  // Flaeche sagt ihres selbst an (wie der Budget-Verlauf).
+  const ratio = H === CHART.H ? '' : ` style="aspect-ratio: ${W} / ${H}"`;
   return `
-    <svg class="chart health-chart health-activity-chart" viewBox="0 0 ${W} ${H}" role="img"
+    <svg class="chart health-chart health-activity-chart" viewBox="0 0 ${W} ${H}"${ratio} role="img"
          aria-label="${esc(t('health.activity.chartTitle'))}">
       ${grid}
       ${bars}
     </svg>
     ${table}`;
+}
+
+/** Die Flaeche des Aktivitaets-Diagramms unter 640px (siehe activityChartMarkup). */
+const ACTIVITY_CHART_NARROW = Object.freeze({ ...CHART, H: 320, PAD_B: 44 });
+
+function activityChartGeometry() {
+  return isPhone() ? ACTIVITY_CHART_NARROW : CHART;
+}
+
+/**
+ * Ein Balken, OBEN VOLL GERUNDET und unten gerade auf der Grundlinie: der
+ * Radius ist die halbe Breite, bei sehr kleinen Werten die Balkenhoehe (ein
+ * flacher Bogen statt einer Kappe, die ueber den Wert hinausragte). Ein
+ * `<rect rx>` rundete auch die Fuesse - der Balken schwebte ueber der Achse.
+ */
+function activityBarPath(x, y, width, bottom) {
+  const r = Math.min(width / 2, bottom - y);
+  const f = (v) => v.toFixed(1);
+  return `M${f(x)},${f(bottom)} V${f(y + r)} A${f(width / 2)},${f(r)} 0 0 1 ${f(x + width)},${f(y + r)} V${f(bottom)} Z`;
 }
 
 function activityLogMarkup(rows) {
@@ -4512,6 +5052,29 @@ function activityLogMarkup(rows) {
   return `
     <h3 class="health-activity__log-title u-section-title">${esc(t('health.activity.logTitle'))}</h3>
     <ul class="health-activity-list">${rows.map((r) => activityRowMarkup(r, own)).join('')}</ul>`;
+}
+
+/* INTENSITAET IST EINE AUSWAHL, KEIN FREITEXT (Critique 2026-10-16). Das
+ * Feld war ein Textfeld, der Bestand (Demo, Import) schreibt aber die Werte
+ * `low`/`moderate`/`high` - in der Liste stand dann englisches „high" in
+ * deutscher Oberflaeche. Jetzt waehlt man aus drei uebersetzten Stufen und
+ * speichert weiter genau diese Schluessel. Ein freier Altwert, der keine
+ * Stufe ist, bleibt als eigene Option stehen und gewaehlt - Speichern
+ * verliert ihn nicht, die Liste zeigt ihn wie geschrieben. */
+const INTENSITY_LEVELS = ['low', 'moderate', 'high'];
+
+function intensityLabel(value) {
+  const key = String(value ?? '').trim().toLowerCase();
+  return INTENSITY_LEVELS.includes(key) ? t(`health.activity.intensity.${key}`) : String(value ?? '');
+}
+
+function intensityOptionsHtml(current) {
+  const raw = String(current ?? '').trim();
+  const known = INTENSITY_LEVELS.includes(raw.toLowerCase()) ? raw.toLowerCase() : '';
+  const legacy = raw && !known ? `<option value="${esc(raw)}" selected>${esc(raw)}</option>` : '';
+  return `<option value=""${raw ? '' : ' selected'}>${esc(t('health.activity.intensity.none'))}</option>`
+    + INTENSITY_LEVELS.map((level) => `<option value="${level}"${known === level ? ' selected' : ''}>${esc(t(`health.activity.intensity.${level}`))}</option>`).join('')
+    + legacy;
 }
 
 function activityRowMarkup(row, own) {
@@ -4528,7 +5091,7 @@ function activityRowMarkup(row, own) {
   if (row.duration_min != null) meta.push(t('health.activity.unit.min', { value: fmtNum(row.duration_min) }));
   if (row.distance_km != null) meta.push(t('health.activity.unit.km', { value: fmtNum(row.distance_km) }));
   if (row.calories != null) meta.push(t('health.activity.unit.kcal', { value: fmtNum(row.calories) }));
-  if (row.intensity) meta.push(row.intensity);
+  if (row.intensity) meta.push(intensityLabel(row.intensity));
   const metaHtml = meta.length
     ? `<span class="health-activity-row__meta">${meta.map((m) => `<span class="health-activity-row__chip">${esc(m)}</span>`).join('')}</span>`
     : '';
@@ -4599,54 +5162,68 @@ function openActivityModal(row, opts = {}) {
   const customValue = isEdit && !isPreset ? val(row.type) : '';
   const dateValue = isEdit && row.performed_at
     ? String(row.performed_at).slice(0, 16)
-    : localDateTimeValue(new Date());
+    : nowDateTimeValue(new Date());
 
   openModal({
     title: isEdit ? t('health.activity.edit') : t('health.activity.add'),
     size: 'md',
     content: `
       <form id="activity-form" class="form-stack">
-        <div class="modal-grid modal-grid--2">
-          <div class="form-field">
-            <label class="label" for="activity-type">${esc(t('health.activity.field.type'))}</label>
-            <select class="input" id="activity-type" required>${activityTypeSelectMarkup(isEdit ? row.type : null)}</select>
-          </div>
-          <div class="form-field" id="activity-custom-field" ${customValue ? '' : 'hidden'}>
-            <label class="label" for="activity-custom">${esc(t('health.activity.field.customType'))}</label>
-            <input class="input" id="activity-custom" type="text" maxlength="50" value="${esc(customValue)}">
-          </div>
-        </div>
-        <div class="form-field">
-          <label class="label" for="activity-performed-at">${esc(t('health.activity.field.performedAt'))}</label>
-          <yuvomi-datepicker id="activity-performed-at" type="datetime" value="${esc(dateValue)}"></yuvomi-datepicker>
-        </div>
-        <div class="modal-grid modal-grid--3">
-          <div class="form-field">
-            <label class="label" for="activity-duration">${esc(t('health.activity.field.duration'))}</label>
-            <input class="input" id="activity-duration" type="number" inputmode="numeric" step="1" min="0" value="${esc(val(row?.duration_min))}">
-          </div>
-          <div class="form-field">
-            <label class="label" for="activity-distance">${esc(t('health.activity.field.distance'))}</label>
-            <input class="input" id="activity-distance" type="number" inputmode="decimal" step="any" min="0" value="${esc(val(row?.distance_km))}">
-          </div>
-          <div class="form-field">
-            <label class="label" for="activity-calories">${esc(t('health.activity.field.calories'))}</label>
-            <input class="input" id="activity-calories" type="number" inputmode="numeric" step="1" min="0" value="${esc(val(row?.calories))}">
-          </div>
-        </div>
-        <div class="modal-grid modal-grid--2">
-          <div class="form-field">
-            <label class="label" for="activity-intensity">${esc(t('health.activity.field.intensity'))}</label>
-            <input class="input" id="activity-intensity" type="text" maxlength="30" value="${esc(val(row?.intensity))}">
-          </div>
-          <div class="form-field">
-            <label class="label" for="activity-visibility">${esc(t('health.activity.field.visibility'))}</label>
-            <select class="input" id="activity-visibility">
+        ${/* GRUPPIERTE ZEILEN wie die Messung (Re-Kritik 2026-10-17): Art,
+             Zeitpunkt, Kennzahlen und Sichtbarkeit standen in drei Rastern
+             gestapelt unter ihren Etiketten - der zweite Dialekt im selben
+             Bereich. ids, Reihenfolge und Verhalten sind die alten; die
+             eigene Art bleibt eine verborgene Zeile, bis "Eigene" gewaehlt
+             ist. Die Notiz bleibt ein freies Feld. */ ''}
+        ${formRowsHtml([
+          formRowHtml({
+            label: t('health.activity.field.type'),
+            labelFor: 'activity-type', labelExtra: REQUIRED_MARK,
+            field: true,
+            control: `<select class="form-input" id="activity-type" required>${activityTypeSelectMarkup(isEdit ? row.type : null)}</select>`,
+          }),
+          formRowHtml({
+            label: t('health.activity.field.customType'),
+            labelFor: 'activity-custom',
+            field: true,
+            attrs: { id: 'activity-custom-field', hidden: !customValue },
+            control: `<input class="form-input" id="activity-custom" type="text" maxlength="50" value="${esc(customValue)}">`,
+          }),
+          formRowHtml({
+            label: t('health.activity.field.performedAt'),
+            labelFor: 'activity-performed-at',
+            wide: true,
+            field: true,
+            control: `<yuvomi-datepicker id="activity-performed-at" type="datetime" value="${esc(dateValue)}"></yuvomi-datepicker>`,
+          }),
+        ])}
+        ${formRowsHtml([
+          ['activity-duration', 'health.activity.field.duration', row?.duration_min, { inputmode: 'numeric', step: '1' }],
+          ['activity-distance', 'health.activity.field.distance', row?.distance_km, { inputmode: 'decimal', step: 'any' }],
+          ['activity-calories', 'health.activity.field.calories', row?.calories, { inputmode: 'numeric', step: '1' }],
+        ].map(([id, key, value, attrs]) => formRowHtml({
+          label: t(key),
+          labelFor: id,
+          field: true,
+          control: formCompositeHtml({
+            parts: [{ id, value: val(value) || null, attrs: { type: 'number', min: '0', ...attrs } }],
+          }),
+        })))}
+        ${formRowsHtml([
+          formRowHtml({
+            label: t('health.activity.field.intensity'),
+            labelFor: 'activity-intensity',
+            control: `<select class="form-input" id="activity-intensity">${intensityOptionsHtml(row?.intensity)}</select>`,
+          }),
+          formRowHtml({
+            label: t('health.activity.field.visibility'),
+            labelFor: 'activity-visibility',
+            control: `<select class="form-input" id="activity-visibility">
               <option value="private" ${(row?.visibility || defaultVisibility('activities')) === 'family' ? '' : 'selected'}>${esc(t('health.activity.visibility.private'))}</option>
               <option value="family" ${(row?.visibility || defaultVisibility('activities')) === 'family' ? 'selected' : ''}>${esc(t('health.activity.visibility.family'))}</option>
-            </select>
-          </div>
-        </div>
+            </select>`,
+          }),
+        ])}
         <div class="form-field">
           <label class="label" for="activity-note">${esc(t('health.activity.field.note'))}</label>
           <textarea class="input" id="activity-note" rows="2" maxlength="2000">${esc(val(row?.note))}</textarea>
@@ -4696,7 +5273,7 @@ function openActivityModal(row, opts = {}) {
         } catch (err) {
           console.error('[Health] activity save error:', err);
           submitBtn.disabled = false;
-          window.yuvomi?.showToast(err?.data?.error || t('health.activity.saveError'), 'danger');
+          reportError(err, 'health.activity.saveError', reloadActivity);
         }
       });
     },
@@ -4752,7 +5329,7 @@ async function deleteActivity(row) {
     refocusAfterRender();
   } catch (err) {
     console.error('[Health] activity delete error:', err);
-    window.yuvomi?.showToast(err?.data?.error || t('health.activity.deleteError'), 'danger');
+    reportError(err, 'health.activity.deleteError', reloadActivity);
   }
 }
 
@@ -4789,7 +5366,7 @@ function maybeMountPrevention(activeRoute) {
 async function mountPrevention() {
   prevention.root.replaceChildren();
   prevention.root.insertAdjacentHTML('beforeend',
-    `<div class="health-prevention__loading">${esc(t('common.loading'))}</div>`);
+    areaLoadingMarkup('prevention', 'list'));
 
   try {
     await loadHealthMembers(prevention, healthUser);
@@ -4811,11 +5388,12 @@ async function loadPreventionTypes() {
 
 async function loadPreventionData() {
   const query = prevention.personId ? `?user_id=${encodeURIComponent(prevention.personId)}` : '';
+  const load = beginLoad('prevention');
   const [records, due] = await Promise.all([
     api.get(`/health/prevention/records${query}`),
     api.get(`/health/prevention/due${query}`),
   ]);
-  prevention.records = records.data || [];
+  prevention.records = withoutPendingDeletes('prevention', records.data || [], load);
   prevention.due = due.data || [];
 }
 
@@ -4878,13 +5456,14 @@ function renderPreventionShell() {
     ${preventionDueSectionMarkup()}
     ${groups.length
       ? `<div class="health-prevention__records">${groups.map((rows) => preventionGroupMarkup(rows, own)).join('')}</div>`
-      // EIN LEERZUSTAND MIT WEG (R14 P4, A6 P2-7): vorher „Noch keine
-      // Eintraege." als Zeile, ohne Weg und ohne zu sagen, was hier erscheint.
+      // EIN LEERZUSTAND, DER SAGT, WAS HIER ERSCHEINT (R14 P4, A6 P2-7) -
+      // OHNE ZWEITEN ANLEGE-KNOPF (Critique 2026-10-16, D5): der FAB
+      // „+ Vorsorge" ist der eine Weg, hier stand er ein zweites Mal als
+      // Primaerknopf direkt daneben.
       : emptyStateHTML({
         icon: 'syringe',
         title: t('health.prevention.emptyTitle'),
         description: t('health.prevention.emptyDesc'),
-        action: own && !readOnly() ? { label: t('health.prevention.add'), icon: 'plus', attrs: { id: 'health-prevention-empty-add' } } : null,
       })}
   `);
   if (window.lucide) window.lucide.createIcons({ el: prevention.root });
@@ -4970,7 +5549,6 @@ function wirePrevention() {
   // Der Riegel vor der einen schreibenden Verdrahtung dieses Tabs (#1265).
   if (readOnly()) return;
 
-  prevention.root.querySelector('#health-prevention-empty-add')?.addEventListener('click', () => openPreventionModal(null));
   prevention.root.querySelectorAll('[data-prevention-edit]').forEach((btn) =>
     btn.addEventListener('click', () => {
       const id = Number(btn.dataset.preventionEdit);
@@ -4982,6 +5560,39 @@ function wirePrevention() {
 // --------------------------------------------------------
 // Erfassungs-Modal (Anlegen/Bearbeiten inkl. Löschen)
 // --------------------------------------------------------
+
+/**
+ * SPEICHERN SCHEITERT NUR AN DER GEWAEHLTEN ART (#1909): jemand hat sie in den
+ * Einstellungen geloescht, waehrend der Dialog offen war. Der Dialog bleibt,
+ * die Eingaben bleiben; die Seite holt den frischen Stand, die Auswahl steht
+ * danach auf "keine Art" (nie still auf einer anderen), das Namensfeld ist
+ * wieder da, und der Fokus steht auf der Auswahl. Dasselbe Muster wie in der
+ * Abfuhr (`waste_selected_type_not_found`).
+ *
+ * @returns {Promise<boolean>} true: behandelt, der Aufrufer meldet nichts mehr
+ */
+async function keepDialogForMissingType(err, select, syncName) {
+  if (!select || !isGone(err) || err.data.reason !== 'health_prevention_selected_type_not_found') return false;
+  window.yuvomi?.showToast(errorSentence(err), 'danger');
+  // Die Arten zuerst: reloadPrevention() holt nur Eintraege und Faelligkeiten,
+  // und die Auswahl boete sonst die geloeschte Art weiter an. Scheitert das
+  // Nachladen, faellt wenigstens die gewaehlte Art heraus - der Server hat
+  // gerade gesagt, dass es sie nicht mehr gibt (Codex an #1971).
+  const chosen = Number(select.value);
+  try {
+    await loadPreventionTypes();
+  } catch (loadErr) {
+    console.error('[Health] prevention types reload error:', loadErr);
+    prevention.types = prevention.types.filter((type) => type.id !== chosen);
+  }
+  await reloadPrevention();
+  select.replaceChildren();
+  select.insertAdjacentHTML('beforeend', preventionTypeSelectMarkup(null));
+  select.value = '';
+  syncName?.();
+  select.focus();
+  return true;
+}
 
 function preventionTypeSelectMarkup(current) {
   const options = prevention.types.map((type) =>
@@ -5112,7 +5723,8 @@ function openPreventionModal(row) {
         } catch (err) {
           console.error('[Health] prevention save error:', err);
           submitBtn.disabled = false;
-          window.yuvomi?.showToast(err?.data?.error || t('health.prevention.saveError'), 'danger');
+          if (await keepDialogForMissingType(err, typeSelect, syncName)) return;
+          reportError(err, 'health.prevention.saveError', reloadPrevention);
         }
       });
     },
@@ -5179,10 +5791,13 @@ async function deletePreventionRecord(row) {
   const idx = prevention.records.findIndex((r) => r.id === row.id);
   if (idx === -1) return;
   const [removed] = prevention.records.splice(idx, 1);
+  markPendingDelete('prevention', row.id);
   renderPreventionShell();
   scheduleUndoableDelete({
-    commit: ({ keepalive } = {}) => api.delete(`/health/prevention/records/${row.id}`, { keepalive }),
-    restore: () => { prevention.records.splice(idx, 0, removed); renderPreventionShell(); },
+    commit: ({ keepalive } = {}) => commitPendingDelete('prevention', row.id,
+      () => api.delete(`/health/prevention/records/${row.id}`, { keepalive })),
+    restore: (err) => restoreOrReload(err, 'health.prevention.saveError', reloadPrevention,
+      () => { pendingDeletes.prevention.delete(row.id); prevention.records.splice(idx, 0, removed); renderPreventionShell(); }),
     message: t('health.prevention.deleted'),
   });
 }
@@ -5218,7 +5833,7 @@ function maybeMountNutrition(activeRoute) {
 async function mountNutrition() {
   nutrition.root.replaceChildren();
   nutrition.root.insertAdjacentHTML('beforeend',
-    `<div class="health-nutrition__loading">${esc(t('common.loading'))}</div>`);
+    areaLoadingMarkup('nutrition', 'chart'));
 
   try {
     await loadHealthMembers(nutrition, healthUser);
@@ -5238,11 +5853,12 @@ async function loadNutritionData() {
   // folgt der Geraetezone, der Server folgt der Haushaltszone - und die Zeile
   // im Tagebuch traegt die Haushaltszone. Ohne `date` antwortet die Route mit
   // ihrem eigenen `todayKey()`, und das ist der richtige Tag.
+  const load = beginLoad('nutrition');
   const [entries, summary] = await Promise.all([
     api.get(`/health/nutrition/entries${query}`),
     api.get(`/health/nutrition/summary${query}`),
   ]);
-  nutrition.entries = entries.data || [];
+  nutrition.entries = withoutPendingDeletes('nutrition', entries.data || [], load);
   nutrition.summary = summary.data || null;
 }
 
@@ -5302,12 +5918,12 @@ function renderNutritionShell() {
     ${entries.length
       ? `<h3 class="health-nutrition__entries-title u-section-title">${esc(t('health.nutrition.entriesTitle'))}</h3>
       <ul class="health-nutrition-row-list">${entries.map((row) => nutritionRowMarkup(row, own)).join('')}</ul>`
-      // EIN LEERZUSTAND MIT WEG (R14 P4, A6 P2-7) statt Titel plus Hinweiszeile.
+      // EIN LEERZUSTAND (R14 P4, A6 P2-7) statt Titel plus Hinweiszeile -
+      // ohne zweiten Anlege-Knopf neben dem FAB „+ Mahlzeit" (D5, 2026-10-16).
       : emptyStateHTML({
         icon: 'salad',
         title: t('health.nutrition.emptyTitle'),
         description: t('health.nutrition.emptyDesc'),
-        action: own && !readOnly() ? { label: t('health.nutrition.add'), icon: 'plus', attrs: { id: 'health-nutrition-empty-add' } } : null,
       })}
   `);
   if (window.lucide) window.lucide.createIcons({ el: nutrition.root });
@@ -5326,8 +5942,13 @@ function nutritionTodaySectionMarkup(own) {
   // was wie ein erreichtes Ziel aussaehe.
   const body = target
     ? `<ul class="health-nutrition-progress">${NUTRIENTS.map((n) => nutritionProgressRowMarkup(n, summary)).join('')}</ul>`
-    : `${emptyHintHTML(t('health.nutrition.targetNone'))}
-       <p class="form-hint">${esc(t('health.nutrition.targetNoneHint'))}</p>`;
+    // EINE FLUCHT (Critique 2026-10-16): der zentrierte Leerhinweis stand
+    // ueber einer linksbuendigen Erklaerung - zwei Achsen in drei Zeilen. Beide
+    // Saetze stehen jetzt links unter dem Abschnittstitel.
+    : `<div class="health-nutrition-today__none">
+         <p class="health-nutrition-today__none-title">${esc(t('health.nutrition.targetNone'))}</p>
+         <p class="form-hint">${esc(t('health.nutrition.targetNoneHint'))}</p>
+       </div>`;
 
   const editBtn = own
     ? `<button type="button" class="btn btn--secondary btn--sm" data-nutrition-target
@@ -5425,7 +6046,6 @@ function wireNutrition() {
   if (readOnly()) return;
 
   nutrition.root.querySelector('[data-nutrition-target]')?.addEventListener('click', () => openNutritionTargetModal());
-  nutrition.root.querySelector('#health-nutrition-empty-add')?.addEventListener('click', () => openNutritionModal(null));
 
   nutrition.root.querySelectorAll('[data-nutrition-edit]').forEach((btn) =>
     btn.addEventListener('click', () => {
@@ -5445,19 +6065,25 @@ function nutritionMealSelectMarkup(current) {
   return `<option value="">${esc(t('health.nutrition.field.noMealType'))}</option>${options}`;
 }
 
-/** Die acht Zahlenfelder - EINE Schleife ueber NUTRIENTS, keine acht Abschriften. */
+/** Die acht Zahlenfelder - EINE Schleife ueber NUTRIENTS, keine acht Abschriften.
+ * Als Zeilen (Re-Kritik 2026-10-17): Naehrstoff links, Zahl mit Einheit rechts,
+ * wie Puls und Gewicht in der Messung - statt eines Zweierrasters gestapelter
+ * Felder mit der Einheit in Klammern im Etikett. */
 function nutrientFieldsMarkup(prefix, source) {
   const val = (v) => (v === null || v === undefined ? '' : String(v));
-  return `
-    <div class="modal-grid modal-grid--2 health-nutrition-fields">
-      ${NUTRIENTS.map((n) => `
-        <div class="form-field">
-          <label class="label" for="${prefix}-${esc(n.key)}">${esc(t(n.labelKey))} (${esc(t(n.unitKey))})</label>
-          <input class="input" id="${prefix}-${esc(n.key)}" data-nutrient="${esc(n.key)}"
-                 type="number" inputmode="decimal" min="0" step="${esc(n.step)}"
-                 value="${esc(val(source?.[n.key]))}">
-        </div>`).join('')}
-    </div>`;
+  return formRowsHtml(NUTRIENTS.map((n) => formRowHtml({
+    label: t(n.labelKey),
+    labelFor: `${prefix}-${n.key}`,
+    field: true,
+    control: formCompositeHtml({
+      parts: [{
+        id: `${prefix}-${n.key}`,
+        suffix: t(n.unitKey),
+        value: val(source?.[n.key]) || null,
+        attrs: { type: 'number', inputmode: 'decimal', min: '0', step: String(n.step), 'data-nutrient': n.key },
+      }],
+    }),
+  })), { className: 'health-nutrition-fields' });
 }
 
 /**
@@ -5517,7 +6143,7 @@ function openNutritionTargetModal() {
         } catch (err) {
           console.error('[Health] nutrition target save error:', err);
           submitBtn.disabled = false;
-          window.yuvomi?.showToast(err?.data?.error || t('health.nutrition.targetSaveError'), 'danger');
+          reportError(err, 'health.nutrition.targetSaveError', reloadNutrition);
         }
       });
     },
@@ -5530,7 +6156,7 @@ function openNutritionModal(row) {
   const val = (v) => (v == null ? '' : String(v));
   const whenValue = isEdit && row.consumed_at
     ? String(row.consumed_at).slice(0, 16)
-    : localDateTimeValue(new Date());
+    : nowDateTimeValue(new Date());
   const visibility = row?.visibility || defaultNutritionVisibility();
 
   openModal({
@@ -5538,20 +6164,26 @@ function openNutritionModal(row) {
     size: 'md',
     content: `
       <form id="nutrition-form" class="form-stack">
-        <div class="form-field">
-          <label class="label" for="nutrition-title">${esc(t('health.nutrition.field.title'))}</label>
-          <input class="input" id="nutrition-title" type="text" required maxlength="200" value="${esc(val(row?.title))}">
-        </div>
-        <div class="modal-grid modal-grid--2">
-          <div class="form-field">
-            <label class="label" for="nutrition-consumed-at">${esc(t('health.nutrition.field.consumedAt'))}</label>
-            <yuvomi-datepicker id="nutrition-consumed-at" type="datetime" value="${esc(whenValue)}"></yuvomi-datepicker>
-          </div>
-          <div class="form-field">
-            <label class="label" for="nutrition-meal-type">${esc(t('health.nutrition.field.mealType'))}</label>
-            <select class="input" id="nutrition-meal-type">${nutritionMealSelectMarkup(row?.meal_type ?? null)}</select>
-          </div>
-        </div>
+        ${formRowsHtml([
+          formRowHtml({
+            label: t('health.nutrition.field.title'),
+            labelFor: 'nutrition-title', labelExtra: REQUIRED_MARK,
+            field: true,
+            control: `<input class="form-input" id="nutrition-title" type="text" required maxlength="200" value="${esc(val(row?.title))}">`,
+          }),
+          formRowHtml({
+            label: t('health.nutrition.field.consumedAt'),
+            labelFor: 'nutrition-consumed-at',
+            wide: true,
+            field: true,
+            control: `<yuvomi-datepicker id="nutrition-consumed-at" type="datetime" value="${esc(whenValue)}"></yuvomi-datepicker>`,
+          }),
+          formRowHtml({
+            label: t('health.nutrition.field.mealType'),
+            labelFor: 'nutrition-meal-type',
+            control: `<select class="form-input" id="nutrition-meal-type">${nutritionMealSelectMarkup(row?.meal_type ?? null)}</select>`,
+          }),
+        ])}
         ${nutrientFieldsMarkup('nutrition-entry', row)}
         <div class="form-field">
           <label class="label" for="nutrition-note">${esc(t('health.nutrition.field.note'))}</label>
@@ -5564,13 +6196,14 @@ function openNutritionModal(row) {
              health.nutrition.visibility.* waere die sechste Formulierung
              gewesen. Die aelteren Gesundheits-Tabs behalten ihre eigenen; sie
              sprechen auch ein anderes Vokabular (private/family). -->
-        <div class="form-field">
-          <label class="label" for="nutrition-visibility">${esc(t('common.visibility.label'))}</label>
-          <select class="input" id="nutrition-visibility">
+        ${formRowsHtml(formRowHtml({
+          label: t('common.visibility.label'),
+          labelFor: 'nutrition-visibility',
+          control: `<select class="form-input" id="nutrition-visibility">
             <option value="private" ${visibility === 'all' ? '' : 'selected'}>${esc(t('common.visibility.private'))}</option>
             <option value="all" ${visibility === 'all' ? 'selected' : ''}>${esc(t('common.visibility.all'))}</option>
-          </select>
-        </div>
+          </select>`,
+        }))}
         <div class="modal-panel__footer modal-panel__footer--plain">
           ${isEdit ? `<button type="button" class="btn btn--danger-outline" data-action="nutrition-delete" style="margin-inline-end:auto"><i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${esc(t('common.delete'))}</button>` : ''}
           <button type="button" class="btn btn--secondary" data-action="cancel">${esc(t('common.cancel'))}</button>
@@ -5603,7 +6236,7 @@ function openNutritionModal(row) {
         } catch (err) {
           console.error('[Health] nutrition save error:', err);
           submitBtn.disabled = false;
-          window.yuvomi?.showToast(err?.data?.error || t('health.nutrition.saveError'), 'danger');
+          reportError(err, 'health.nutrition.saveError', reloadNutrition);
         }
       });
     },
@@ -5636,6 +6269,7 @@ async function deleteNutritionEntry(row) {
   const idx = nutrition.entries.findIndex((r) => r.id === row.id);
   if (idx === -1) return;
   const [removed] = nutrition.entries.splice(idx, 1);
+  markPendingDelete('nutrition', row.id);
   renderNutritionShell();
   scheduleUndoableDelete({
     // DIE BILANZ OBEN KOMMT VOM SERVER und weiss von einer nur lokal
@@ -5645,10 +6279,11 @@ async function deleteNutritionEntry(row) {
     // `keepalive` ist der Weg beim Verlassen der Seite: dort gibt es nichts
     // mehr neu zu zeichnen.
     commit: async ({ keepalive } = {}) => {
-      await api.delete(`/health/nutrition/entries/${row.id}`, { keepalive });
+      await commitPendingDelete('nutrition', row.id, () => api.delete(`/health/nutrition/entries/${row.id}`, { keepalive }));
       if (!keepalive) await reloadNutrition();
     },
-    restore: () => { nutrition.entries.splice(idx, 0, removed); renderNutritionShell(); },
+    restore: (err) => restoreOrReload(err, 'health.nutrition.saveError', reloadNutrition,
+      () => { pendingDeletes.nutrition.delete(row.id); nutrition.entries.splice(idx, 0, removed); renderNutritionShell(); }),
     message: t('health.nutrition.deleted'),
   });
 }
@@ -5709,13 +6344,23 @@ function maybeMountOverview(activeRoute) {
 async function mountOverview() {
   overview.root.replaceChildren();
   overview.root.insertAdjacentHTML('beforeend',
-    `<div class="health-overview__loading">${esc(t('common.loading'))}</div>`);
+    areaLoadingMarkup('overview', 'list'));
 
   try {
-    await loadHealthMembers(overview, healthUser);
     const today = todayKey();
     overview.exportRange = { from: addLocalDays(today, -(OVERVIEW_EXPORT_DAYS - 1)), to: today };
-    await loadOverview();
+    // EINE WELLE STATT ZWEI (Critique R18). Die Mitgliederliste bestimmt die
+    // gezeigte Person nur, wenn noch keine feststeht und auch die eigene nicht
+    // bekannt ist (loadHealthMembers). Sonst haengt loadOverview() nicht an ihr -
+    // die Person steht dann hier schon fest, und beide laufen gleichzeitig.
+    const person = overview.personId ?? overview.meId;
+    if (person) {
+      overview.personId = person;
+      await Promise.all([loadHealthMembers(overview, healthUser), loadOverview()]);
+    } else {
+      await loadHealthMembers(overview, healthUser);
+      await loadOverview();
+    }
     overview.error = false;
   } catch (err) {
     console.error('[Health] overview mount error:', err);
@@ -5727,14 +6372,6 @@ async function mountOverview() {
 
 async function loadOverview() {
   const query = overview.personId ? `?user_id=${encodeURIComponent(overview.personId)}` : '';
-  const [vRes, mRes] = await Promise.all([
-    api.get(`/health/vitals${query}`),
-    api.get(`/health/medications${query}`),
-  ]);
-  overview.vitals = vRes.data || [];
-  overview.meds = mRes.data || [];
-  overview.schedulesByMed = {};
-  overview.logsByMed = {};
 
   // Nur laden, wenn der Zyklus-Tab fuer DIESEN Betrachter ueberhaupt
   // erreichbar waere (cycleEnabled, siehe Dateikopf) - sonst zwei zusaetzliche
@@ -5742,24 +6379,32 @@ async function loadOverview() {
   // Einstellungen (privat) nur in der eigenen Ansicht, exakt wie loadCycle()
   // im Zyklus-Tab selbst - fuer eine fremde Person bleibt es bei der aus
   // ihrer Perioden-Historie abgeleiteten Standardvorhersage.
-  if (cycleEnabled) {
-    const [cpRes, clRes] = await Promise.all([
-      api.get(`/health/cycle/periods${query}`),
-      api.get(`/health/cycle/logs${query}`),
-    ]);
-    overview.cyclePeriods = cpRes.data || [];
-    overview.cycleLogs = clRes.data || [];
-    if (overview.personId === overview.meId) {
-      try { overview.cycleSettings = (await api.get('/health/cycle/settings')).data || {}; }
-      catch { overview.cycleSettings = {}; }
-    } else {
-      overview.cycleSettings = null;
-    }
-  } else {
-    overview.cyclePeriods = [];
-    overview.cycleLogs = [];
-    overview.cycleSettings = null;
-  }
+  const ownView = overview.personId === overview.meId;
+  const empty = { data: [] };
+
+  // EINE WELLE (Critique R18). Vitalwerte, Medikamente und die drei
+  // Zyklus-Abrufe haengen nicht voneinander ab, liefen aber in drei Wellen
+  // hintereinander (gemessen am gedrosselten Telefon: 1698, 1880, 2055 ms nach
+  // dem Start, je rund 175 ms Rundreise). WER was laden darf, entscheidet
+  // weiter dieselbe Regel wie oben - sie waehlt nur noch, welche Abrufe in der
+  // Welle stehen. Ein Fehler bei den Einstellungen bleibt folgenlos (leere
+  // Einstellungen), jeder andere bricht das Laden ab wie vorher.
+  const [vRes, mRes, cpRes, clRes, cycleSettings] = await Promise.all([
+    api.get(`/health/vitals${query}`),
+    api.get(`/health/medications${query}`),
+    cycleEnabled ? api.get(`/health/cycle/periods${query}`) : empty,
+    cycleEnabled ? api.get(`/health/cycle/logs${query}`) : empty,
+    cycleEnabled && ownView
+      ? api.get('/health/cycle/settings').then((res) => res.data || {}, () => ({}))
+      : null,
+  ]);
+  overview.vitals = vRes.data || [];
+  overview.meds = mRes.data || [];
+  overview.schedulesByMed = {};
+  overview.logsByMed = {};
+  overview.cyclePeriods = cpRes.data || [];
+  overview.cycleLogs = clRes.data || [];
+  overview.cycleSettings = cycleSettings;
 
   const today = todayKey();
   await Promise.all(overview.meds.map(async (m) => {
@@ -5774,7 +6419,7 @@ async function loadOverview() {
 }
 
 function overviewAllSchedules() {
-  return overview.meds.flatMap((m) => overview.schedulesByMed[m.id] || []);
+  return currentSchedules(overview.meds, overview.schedulesByMed);
 }
 
 function overviewAllLogs() {
@@ -5786,9 +6431,14 @@ function overviewAllLogs() {
  * Adhaerenz misst die Einhaltung eines Plans, und eine Bedarfsdosis hat keinen;
  * seit sie nicht mehr am Zeitraumfilter haengenbleibt (#700), muss sie hier
  * ausdruecklich draussen bleiben. Auch der Streak rechnet nur mit ihnen.
+ *
+ * Und nur die der Medikamente, die heute zaehlen (#1950) - dieselbe Menge wie
+ * `overviewAllSchedules()`, damit Zaehler und Nenner dieselben Medikamente
+ * meinen.
  */
 function overviewScheduledLogs() {
-  return scheduledLogs(overviewAllLogs());
+  return scheduledLogs(overview.meds.filter(medicationCountsToday)
+    .flatMap((m) => overview.logsByMed[m.id] || []));
 }
 
 function overviewFindLog(dose) {
@@ -5825,6 +6475,9 @@ function renderOverviewShell() {
 
   if (overview.error) {
     mountAreaLoadError(overview, 'overview', mountOverview);
+    // Es kommt nichts mehr, das vor die Liste zieht - das Skelett geht.
+    _priorityPending = false;
+    syncPriorityRegion();
     return;
   }
 
@@ -6096,7 +6749,7 @@ async function handleOverviewDose(btn, action) {
   } catch (err) {
     console.error('[Health] overview dose error:', err);
     setDoseBusy(medId, false);
-    window.yuvomi?.showToast(err?.data?.error || t('health.meds.doseError'), 'danger');
+    reportError(err, 'health.meds.doseError', reloadMedViews, { fromDialog: false });
   }
 }
 
@@ -6176,7 +6829,7 @@ function overviewVitalsMarkup() {
   const cards = entries
     .map(({ metric, series }) => overviewVitalCardMarkup(metric, series, { extra: !core.has(metric.type) }))
     .join('');
-  return `<div class="health-overview__vitals-grid">${cards}</div>`;
+  return `<div class="health-overview__vitals-grid metric-rows">${cards}</div>`;
 }
 
 function overviewVitalCardMarkup(metric, series, { extra = false } = {}) {
@@ -6411,15 +7064,44 @@ function maybeMountCycle(activeRoute) {
   mountCycle();
 }
 
+// Der Nachtrag des Fastens, wie ihn das Fasten-Modul freigibt (nur in der
+// eigenen Ansicht mit Schreibrecht) - `null` heisst: kein FAB.
+let _fastingCreate = null;
+
 function maybeMountFasting(activeRoute) {
   if (activeRoute !== '/health/fasting' || !fastingEnabled) return;
   const root = _container?.querySelector('[data-fasting-root]');
   if (!root) return;
   root.dataset.fastingMounted = 'true';
-  import('/pages/health-fasting.js').then(({ mountFasting }) => mountFasting(root, { userId: vitals.meId })).catch((error) => {
+  import('/pages/health-fasting.js').then(({ mountFasting }) => mountFasting(root, {
+    userId: vitals.meId,
+    onCreateAction: (fn) => { _fastingCreate = fn; refreshHealthFab(); },
+  })).catch((error) => {
+    // Die Ueberschrift ist der Satz. `error.message` ist der Text des Browsers
+    // oder des Servers, unuebersetzt (#1909) - er gehoert in die Konsole.
+    console.error('[Health] fasting mount error:', error);
     root.replaceChildren();
-    root.insertAdjacentHTML('beforeend', `<div class="fasting-panel__error" role="alert"><h3>${esc(t('health.fasting.loadError'))}</h3><p>${esc(error?.message || '')}</p></div>`);
+    root.insertAdjacentHTML('beforeend', `<div class="fasting-panel__error" role="alert"><h3>${esc(t('health.fasting.loadError'))}</h3></div>`);
   });
+}
+
+/**
+ * DER LADEZUSTAND EINES BEREICHS IST EIN SKELETT, KEIN WORT (R18). Sieben der
+ * acht Bereiche luden mit "Lade..." in Sekundaerschrift, der Zyklus mit seiner
+ * Silhouette (cycleSkeletonMarkup). Die Form folgt dem, was kommt: `chart`
+ * fuer Bereiche, die mit Kennzahlen und Kurven oeffnen, `list` fuer
+ * Zeilenlisten. Der Text bleibt fuer Screenreader (`role="status"`), das
+ * Skelett selbst ist `aria-hidden` (utils/skeleton.js).
+ *
+ * @param {string} area - Bereichsname der Klasse (`health-<area>__loading`)
+ * @param {'list'|'chart'} shape
+ */
+function areaLoadingMarkup(area, shape) {
+  const skeleton = shape === 'chart' ? renderSkeletonChart({ charts: 2 }) : renderSkeletonList({ rows: 3, lines: 2 });
+  return `<div class="health-${area}__loading" role="status">
+    <span class="sr-only">${esc(t('common.loading'))}</span>
+    ${skeleton}
+  </div>`;
 }
 
 function cycleSkeletonMarkup() {
@@ -6563,11 +7245,8 @@ function renderCycleShell() {
     icon: 'droplet',
     title: t('health.cycle.emptyTitle'),
     description: t('health.cycle.emptyDesc'),
-    // Ohne eigenen Zyklus - und ohne Schreibrecht auf das Modul - gibt es hier
-    // nichts einzutragen: der CTA entfaellt, die Aussage bleibt.
-    action: darf
-      ? { label: t('health.cycle.emptyCta'), icon: 'plus', attrs: { 'data-action': 'cycle-first' } }
-      : undefined,
+    // KEIN ZWEITER ANLEGE-KNOPF (Critique 2026-10-16, D5): „Erste Periode
+    // erfassen" oeffnete denselben Dialog wie der FAB „+ Periode" daneben.
   })}`);
     if (window.lucide) window.lucide.createIcons({ el: cycle.root });
     wireCycle();
@@ -7137,7 +7816,7 @@ async function cycleStartPeriodToday() {
     await reloadCycle();
   } catch (err) {
     console.error('[Health] cycle start error:', err);
-    window.yuvomi?.showToast(err?.data?.error || t('health.cycle.saveError'), 'danger');
+    reportError(err, 'health.cycle.saveError', reloadCycle, { fromDialog: false });
   }
 }
 
@@ -7151,7 +7830,7 @@ async function cycleEndPeriodToday() {
     await reloadCycle();
   } catch (err) {
     console.error('[Health] cycle end error:', err);
-    window.yuvomi?.showToast(err?.data?.error || t('health.cycle.saveError'), 'danger');
+    reportError(err, 'health.cycle.saveError', reloadCycle, { fromDialog: false });
   }
 }
 
@@ -7190,7 +7869,10 @@ function cycleMonthLabel(anchorKey) {
  *                         'predicted' | null), `pms`, `intimacy`
  */
 function cycleDayLabel(c, { symptom = null, pms = false, intimacy = false } = {}) {
-  const parts = [formatDate(c.dateKey)];
+  // DIE SICHTBARE ZIFFER ZUERST (R20, WCAG 2.5.3 Label in Name): die Zelle
+  // zeigt „1", ihr Name begann mit „01.10.2026" - wer per Sprache „1"
+  // ansagt, traf nichts. Danach das volle Datum, wie bisher.
+  const parts = [String(Number(String(c.dateKey).slice(8, 10))), formatDate(c.dateKey)];
   if (c.isToday) parts.push(t('health.cycle.legend.today'));
   if (c.phase === PHASE.MENSTRUATION) parts.push(t('health.cycle.legend.period'));
   else if (c.phase === PHASE.FERTILE) parts.push(t('health.cycle.legend.fertile'));
@@ -7552,9 +8234,11 @@ function simpleLineChartMarkup({ points, titleText, formatPointTooltip, formatTa
       <div class="health-chart-section__head"><div class="health-chart-section__title">${esc(titleText)}</div></div>
       <svg class="chart health-chart" viewBox="0 0 ${W} ${H}" role="img"${chartRatioAttr(geo)} aria-label="${esc(titleText)}">
         ${grid}
-        ${area}
-        ${polylines}
-        ${dots}
+        <g class="health-chart__lines">
+          ${area}
+          ${polylines}
+          ${dots}
+        </g>
         ${xLabels}
       </svg>
       ${table}
@@ -7611,7 +8295,7 @@ function cycleLengthTrendChartMarkup(trend) {
     const typical = isTypicalCycleLength(e.days);
     const color = typical ? 'var(--module-health)' : 'var(--color-warning)';
     const label = `${formatDate(e.date)}: ${t('health.cycle.unit.days', { value: fmtNum(e.days), count: e.days })} (${typicalLabel(typical)})`;
-    return `<rect x="${(cx - barW / 2).toFixed(1)}" y="${by.toFixed(1)}" width="${barW.toFixed(1)}" height="${(bottom - by).toFixed(1)}" rx="2" fill="${color}"><title>${esc(label)}</title></rect>`;
+    return `<rect class="chart__bar" x="${(cx - barW / 2).toFixed(1)}" y="${by.toFixed(1)}" width="${barW.toFixed(1)}" height="${(bottom - by).toFixed(1)}" rx="2" fill="${color}"><title>${esc(label)}</title></rect>`;
   }).join('');
 
   const grid = chartGridMarkup(min, max, (val, whole) => (whole ? String(Math.round(val)) : fmtNum(val)), geo, steps);
@@ -7888,7 +8572,7 @@ function flowLoadTrendChartMarkup(trend) {
     // das darf im Hover/der Tabelle nicht verschwinden.
     const daysText = t('health.cycle.unit.days', { value: fmtNum(e.loggedDays), count: e.loggedDays });
     const label = `${formatDate(e.date)}: ${t('health.cycle.trends.flowLoadValue', { load: fmtNum(e.load, { maximumFractionDigits: 0 }), days: daysText })}`;
-    return `<rect x="${(cx - barW / 2).toFixed(1)}" y="${by.toFixed(1)}" width="${barW.toFixed(1)}" height="${(bottom - by).toFixed(1)}" rx="2" fill="var(--module-health)"><title>${esc(label)}</title></rect>`;
+    return `<rect class="chart__bar" x="${(cx - barW / 2).toFixed(1)}" y="${by.toFixed(1)}" width="${barW.toFixed(1)}" height="${(bottom - by).toFixed(1)}" rx="2" fill="var(--module-health)"><title>${esc(label)}</title></rect>`;
   }).join('');
 
   const grid = chartGridMarkup(min, max, (val, whole) => (whole ? String(Math.round(val)) : fmtNum(val)), geo, steps);
@@ -8144,6 +8828,7 @@ function cycleFooterMarkup(canEdit, prediction = null) {
 // --------------------------------------------------------
 
 function wireCycle() {
+  drawHealthCharts(cycle.root, 'health-cycle');
   wireTablistKeys(cycle.root);
   installPopoverMenus(cycle.root);
   wirePersonSwitcher(cycle, switchCyclePerson);
@@ -8179,7 +8864,6 @@ function wireCycle() {
       if (p) openPeriodModal(p);
     }));
 
-  cycle.root.querySelector('[data-action="cycle-first"]')?.addEventListener('click', () => openPeriodModal(null));
   cycle.root.querySelector('[data-action="cycle-start-period"]')?.addEventListener('click', () => cycleStartPeriodToday());
   cycle.root.querySelector('[data-action="cycle-end-period"]')?.addEventListener('click', () => cycleEndPeriodToday());
   cycle.root.querySelector('[data-action="cycle-log-today"]')?.addEventListener('click', () => openDayLogModal(todayKey()));
@@ -8309,7 +8993,7 @@ function openPeriodModal(period) {
         } catch (err) {
           console.error('[Health] cycle period save error:', err);
           submitBtn.disabled = false;
-          window.yuvomi?.showToast(err?.data?.error || t('health.cycle.saveError'), 'danger');
+          reportError(err, 'health.cycle.saveError', reloadCycle);
         }
       });
     },
@@ -8329,7 +9013,7 @@ async function deletePeriod(period) {
     refocusAfterRender();
   } catch (err) {
     console.error('[Health] cycle period delete error:', err);
-    window.yuvomi?.showToast(err?.data?.error || t('health.cycle.deleteError'), 'danger');
+    reportError(err, 'health.cycle.deleteError', reloadCycle);
   }
 }
 
@@ -8417,7 +9101,7 @@ function openCycleImportModal() {
             errorsBox.hidden = false;
           } else {
             console.error('[Health] cycle import error:', err);
-            window.yuvomi?.showToast(err?.data?.error || t('health.cycle.import.error'), 'danger');
+            reportError(err, 'health.cycle.import.error', reloadCycle);
           }
         }
       });
@@ -8707,7 +9391,7 @@ function openDayLogModal(dateKey) {
         } catch (err) {
           console.error('[Health] cycle log save error:', err);
           submitBtn.disabled = false;
-          window.yuvomi?.showToast(err?.data?.error || t('health.cycle.saveError'), 'danger');
+          reportError(err, 'health.cycle.saveError', reloadCycle);
         }
       });
     },
@@ -8725,7 +9409,7 @@ async function deleteDayLog(log) {
     refocusAfterRender();
   } catch (err) {
     console.error('[Health] cycle log delete error:', err);
-    window.yuvomi?.showToast(err?.data?.error || t('health.cycle.deleteError'), 'danger');
+    reportError(err, 'health.cycle.deleteError', reloadCycle);
   }
 }
 
@@ -8920,7 +9604,7 @@ function openCycleSettingsModal() {
           await reloadCycle();
         } catch (err) {
           console.error('[Health] cycle bulk visibility error:', err);
-          window.yuvomi?.showToast(err?.data?.error || t('health.cycle.saveError'), 'danger');
+          reportError(err, 'health.cycle.saveError', reloadCycle);
         } finally {
           bulkRun.disabled = false;
         }
@@ -8963,7 +9647,7 @@ function openCycleSettingsModal() {
         } catch (err) {
           console.error('[Health] cycle settings save error:', err);
           submitBtn.disabled = false;
-          window.yuvomi?.showToast(err?.data?.error || t('health.cycle.saveError'), 'danger');
+          reportError(err, 'health.cycle.saveError', reloadCycle);
         }
       });
     },
@@ -8985,6 +9669,8 @@ export const __test = {
   recentMeasurementsMarkup,
   // R8 H9: Bearbeiten von Messung und Analyt.
   openVitalModal,
+  // R18: die Wertefelder des Dialogs als Formularzeilen (Paar, Dauer, Skala).
+  valueFieldsMarkup,
   // Re-Critique 2026-09-27 (M3): das mobile Detailblatt und die Zeile der
   // leeren Metriken.
   openVitalSheet,
@@ -8997,6 +9683,8 @@ export const __test = {
   // C7: Kalender und Trends als Paar.
   cyclePairMarkup,
   VITAL_SHEET_CHART,
+  // R18: die Balken der Aktivitaet (Flaeche, Balkenform, heute im Vollton).
+  activityChartMarkup, activityBarPath, ACTIVITY_CHART_NARROW,
   CYCLE_TREND_CHART,
   backToVitalSheetForTest: (type) => backToVitalSheet(type),
   vitalPatchBody,
@@ -9006,6 +9694,8 @@ export const __test = {
   dueRowMarkup,
   prnRowMarkup,
   medCardMarkup,
+  // R20: der Medikament-Dialog in einem Schritt (Entwurf des Einnahmeplans).
+  openMedModal,
   medLogHistoryMarkup,
   labDetailMarkup,
   activityRowMarkup,
@@ -9017,6 +9707,9 @@ export const __test = {
   nutritionRowMarkup,
   nutritionProgressRowMarkup,
   overviewDueRowMarkup,
+  // #1950: die Leser der Faelligkeit selbst, nicht nur ihre Zeile - an ihnen
+  // haengt, WELCHE Medikamente heute zaehlen.
+  dueTodayMarkup, overviewDueMarkup, overviewUpcomingMarkup, medListMarkup,
   // Einnahmetreue auf beiden Flaechen (R16): dieselbe Zahl, derselbe Zeitraum.
   adherenceMarkup, overviewAdherenceMarkup,
   // Uebersicht mobil (R16): Export im Kopf, drei Kernwerte.
@@ -9032,6 +9725,13 @@ export const __test = {
   cycleDayLabel,
   cycleHistoryMarkup,
   cycleFooterMarkup,
+  // #1909: die Fehlerwege bis in ihr catch - Loeschen, Zyklus heute, und die
+  // Dialoge mit eigenem Fall (gewaehlte Vorsorgeart, Import der Historie).
+  deleteMed, deleteMedLog, deleteLabReport, deleteActivity, deletePeriod, deleteDayLog, deleteVitalWithUndo,
+  cycleStartPeriodToday, cycleEndPeriodToday,
+  openPreventionModal, openCycleImportModal,
+  // Codex an #1971: welche Messungen die Seite gerade zeigt (nur die Ids).
+  vitalRowIdsForTest: () => vitals.rows.map((row) => row.id),
   /**
    * Testseam fuer die Tab-Zustaende: EIN benannter View, EIN Patch. Die Views
    * selbst bleiben drinnen - ein Test kann Felder setzen, nicht die Objekte

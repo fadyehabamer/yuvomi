@@ -30,8 +30,10 @@ test('der Leerzustand unterscheidet Suche, Filter, Archiv und Erstnutzung', () =
   // Vorher gab es EINEN Zustand: eine Suche ohne Treffer behauptete "Noch keine
   // Dokumente" und bot Hochladen an, während der Ordner-Browser daneben 6 zählte.
   assert.match(page, /function emptyStateFor\(\)/);
+  // Die leere SUCHE baut seit R19 der geteilte Baustein (mountSearchEmpty).
+  assert.match(page, /if \(state\.query\) \{\s*return \{\s*search: true,/);
+  assert.match(page, /mountSearchEmpty\(list, \{/);
   for (const key of [
-    'documents.emptySearchTitle',
     'documents.emptyFilterTitle',
     'documents.emptyArchivedTitle',
     'documents.emptyTitle',
@@ -257,8 +259,8 @@ test('Ordnerlöschung bietet Behalten oder Mitlöschen mit exakten Server-Zahlen
   assert.match(block, /expected_folders=\$\{impact\.removed_folders\}/);
   assert.match(block, /choice === 'delete'[\s\S]*expected_snapshot=\$\{encodeURIComponent\(impact\.snapshot\)\}/);
   assert.match(block, /const expectedSnapshot = choice === 'delete'[\s\S]*: '';/);
-  assert.match(block, /handleError: \(err\) => handleFolderDeleteError\(err, folder, \{ delayed: true \}\)/);
-  assert.match(block, /catch \(err\) \{\s*await handleFolderDeleteError\(err, folder\);\s*\}/);
+  assert.match(block, /handleError: \(err\) => handleFolderDeleteError\(err, folder, \{ delayed: true, owner \}\)/);
+  assert.match(block, /catch \(err\) \{\s*await handleFolderDeleteError\(err, folder, \{ owner \}\);\s*\}/);
   assert.match(block, /function handleFolderDeleteError[\s\S]{0,260}handleFolderDeleteFailure\(\{/);
   assert.match(block, /result\.contents_changed[\s\S]*folderDeleteContentsChangedToast/);
   assert.match(block, /failed_documents[\s\S]*failure_stage !== 'concurrency'/);
@@ -362,8 +364,10 @@ test('das Rückgängig-Löschen stellt die Server-Sortierung wieder her', () => 
   const del = page.slice(page.indexOf('function deleteDocuments'), page.indexOf('function deleteDocuments') + 2400);
   assert.doesNotMatch(del, /localeCompare/);
   assert.match(del, /applyFilters\(\)/);
-  // Kein Nachladen auf einen abgehängten Container nach Seitenwechsel.
-  assert.match(del, /if \(_container !== owner\) return/);
+  // Kein Nachladen auf einen abgehängten Container nach Seitenwechsel - auch
+  // nicht, wenn `_container` noch auf ihn zeigt (stillShown prueft das DOM,
+  // Codex an #2001; als Programm gefahren in test:documents-errors).
+  assert.match(del, /if \(!stillShown\(owner\)\) return/);
 });
 
 test('das Speichern referenziert den Submit-Button am Panel, nicht am Formular (#543)', () => {
@@ -1094,9 +1098,15 @@ test('die Dokumentenseite haengt die Vorschauen an das Seitenleben', () => {
   assert.match(wiring, /_thumbs\.load\(doc\)/);
   const list = page.slice(page.indexOf('function renderDocuments('), page.indexOf('function visibleFolderRows('));
   assert.match(list, /wireLocalThumbs\(list\)/);
-  // Zeile und Karte tragen denselben Rahmen; nur Kandidaten melden sich an.
-  assert.match(page, /renderThumbSlot\(doc, 'document-row__icon'\)/);
+  // Die Karte traegt die Vorschau; nur Kandidaten melden sich an. Die ZEILE
+  // zeigt seit R18 (2026-10-07) das Kategorie-Glyph statt einer 42px-Vorschau
+  // und meldet deshalb kein Bild mehr an.
   assert.match(page, /renderThumbSlot\(doc, 'document-card__media'\)/);
+  assert.doesNotMatch(page, /renderThumbSlot\(doc, 'document-row__icon'\)/, 'die Zeile laedt keine Vorschau');
+  const rowGlyph = page.slice(page.indexOf('function renderRowGlyph('), page.indexOf('function renderRowGlyph(') + 300);
+  assert.match(rowGlyph, /class="document-row__icon"><i data-lucide="\$\{CATEGORY_ICONS\[doc\.category\] \|\| 'file'\}"/,
+    'die Zeile traegt das Zeichen ihrer Kategorie');
+  assert.doesNotMatch(rowGlyph, /data-local-thumb|document-thumb/, 'und keinen Vorschau-Rahmen');
   assert.match(page, /const local = documentThumbKind\(doc\) \? ' data-local-thumb' : ''/);
 });
 
@@ -1109,7 +1119,7 @@ test('der Paperless-Pfad bleibt, wie er war', () => {
   assert.match(slot, /data-thumb="clickable"/);
 });
 
-test('die Rasterkarte traegt eine feste Vorschauflaeche, das Bild fuellt sie ohne Verzerrung', () => {
+test('die Rasterkarte traegt eine feste Vorschauflaeche, das Blatt liegt GANZ und unverzerrt darin', () => {
   const rules = [...eachRule(css)];
   const top = rules.filter((rule) => rule.at.length === 0);
   const media = top.find((rule) => rule.selector === '.document-card__media');
@@ -1117,11 +1127,26 @@ test('die Rasterkarte traegt eine feste Vorschauflaeche, das Bild fuellt sie ohn
   assert.match(media.body, /aspect-ratio:\s*\d+\s*\/\s*\d+/, 'feste Form: ein spaet ankommendes Bild schiebt nichts');
   assert.match(media.body, /border-radius:\s*var\(--radius-/);
   assert.match(media.body, /background:\s*var\(--color-/);
+  // R18 (2026-10-07): das Bild ist ein BLATT auf der Mulde - ganz (contain,
+  // eigene Masse), mit Schatten am Blattrand, im Dark gedaempft. Bis dahin
+  // `cover` mit einer Haarlinie als ::after ueber dem Ausschnitt.
   const img = top.find((rule) => rule.selector === '.document-thumb__img');
-  assert.match(img.body, /object-fit:\s*cover/);
-  const frame = top.find((rule) => rule.selector === '.document-thumb--ready::after');
-  assert.ok(frame, 'der Rahmen liegt ueber dem Bild');
-  assert.match(frame.body, /var\(--color-border-subtle\)/);
+  assert.match(img.body, /object-fit:\s*contain/, 'das ganze Blatt, kein Ausschnitt');
+  assert.doesNotMatch(img.body, /object-fit:\s*cover|position:\s*absolute/);
+  assert.match(img.body, /max-width:\s*100%/);
+  assert.match(img.body, /max-height:\s*100%/);
+  assert.match(img.body, /width:\s*auto/, 'eigene Masse: der Schatten sitzt am Blatt, nicht am Rahmen');
+  assert.match(img.body, /box-shadow:\s*var\(--shadow-sm\)/);
+  assert.match(img.body, /opacity:\s*var\(--media-sheet-opacity\)/, 'im Dark scheint die Mulde durch das Weiss');
+  assert.doesNotMatch(img.body, /(?:^|;)\s*filter\s*:/, 'kein filter: .app-content * setzt ihn per !important zurueck');
+  assert.match(media.body, /background:\s*var\(--color-fill-well\)/, 'der Rahmen ist eine Mulde');
+  assert.match(media.body, /padding:\s*var\(--space-3\)/, 'das Blatt liegt mit Rand in der Mulde');
+  const tokens = read('../public/styles/tokens.css');
+  assert.match(tokens, /--_media-sheet-opacity:\s*1;/);
+  assert.equal((tokens.match(/--_media-sheet-opacity:\s*0\.82;/g) ?? []).length, 2, 'beide Dark-Bloecke daempfen das Blatt');
+  // Das Einblenden endet auf der Deckkraft des Blatts, nicht auf 1.
+  const kf = css.slice(css.indexOf('@keyframes document-thumb-in'), css.indexOf('@keyframes document-thumb-in') + 120);
+  assert.doesNotMatch(kf, /to\s*\{\s*opacity:\s*1/, 'ein festes Ende auf 1 hoebe die Daempfung im Dark nach dem Einblenden auf');
   // Einblenden nur ohne abbestellte Bewegung, und nur frisch angekommene Bilder.
   const fade = rules.filter((rule) => /animation:\s*document-thumb-in/.test(rule.body));
   assert.ok(fade.length > 0, 'Einblend-Regel fehlt');
@@ -1190,10 +1215,15 @@ test('das Raster hat mobil zwei Spalten und bei 1280px drei statt zwei', () => {
   assert.match(grid.body, /gap:\s*var\(--space-4\)/);
 });
 
-test('die Karte ist kompakt: 4:3-Vorschau, Titel zweizeilig, Meta einzeilig, kein Mindest-Leerraum', () => {
+test('die Karte: Blatt-Rahmen 3:4, Titel zweizeilig, Meta einzeilig, kein Mindest-Leerraum, nicht gestreckt', () => {
   const rules = topRules(css);
   const media = rules.find((rule) => rule.selector === '.document-card__media');
-  assert.match(media.body, /aspect-ratio:\s*4\s*\/\s*3/, 'ehrliche feste Form, flacher als 16/10 zu hoch war es nicht - 4:3 ist der Kanon-Rahmen');
+  // R18 (2026-10-07): der Rahmen ist hochkant wie das Blatt, das ganz darin
+  // liegt (vorher 4:3 mit dem oberen Drittel als Ausschnitt).
+  assert.match(media.body, /aspect-ratio:\s*3\s*\/\s*4/, 'feste Form, hochkant wie ein Blatt');
+  // Und die Karten einer Reihe strecken sich nicht mehr: die Aktionszeile
+  // schliesst an den Text an, statt unter einem Loch zu stehen.
+  assert.match(rules.find((rule) => rule.selector === '.documents-list--grid').body, /align-items:\s*start/);
   const title = rules.find((rule) => rule.selector === '.document-card__title');
   assert.ok(title, '.document-card__title fehlt als eigene Regel');
   assert.match(title.body, /-webkit-line-clamp:\s*2/);
@@ -1211,15 +1241,20 @@ test('die Karte ist kompakt: 4:3-Vorschau, Titel zweizeilig, Meta einzeilig, kei
   assert.match(card, /doc\.description \? `<p class="document-card__description">\$\{esc\(doc\.description\)\}<\/p>` : ''/);
 });
 
-test('der Kopf hat EINE Hoehe: Ansichtsumschalter so hoch wie Suche und Knoepfe', () => {
-  // Gemessen vorher bei 1280px: Suche 44, Umschalter 48, Menueknopf 44; mobil
-  // 48 / 52 / 48. Der Umschalter ist ein Well mit 2px Rand - seine Knoepfe
-  // muessen um genau diesen Rand kleiner sein als --target-base.
-  const toggle = topRules(css).find((rule) => rule.selector === '.documents-view-toggle');
-  assert.match(toggle.body, /padding:\s*var\(--space-0h\)/);
-  const btn = topRules(css).find((rule) => rule.selector === '.documents-view-toggle__btn');
-  assert.match(btn.body, /width:\s*calc\(var\(--target-base\) - 2 \* var\(--space-0h\)\)/);
-  assert.match(btn.body, /height:\s*calc\(var\(--target-base\) - 2 \* var\(--space-0h\)\)/);
+test('der Ansichtsumschalter ist das Kanon-Segment (D1) und so hoch wie Suche und Knoepfe', () => {
+  // Gemessen vorher bei 1280px: Suche 44, Umschalter 48, Menueknopf 44. Seit
+  // D1 (Critique 2026-10-16) ist der Umschalter `.segmented` in der Icon-
+  // Variante; die Kopfhoehe rechnet panel.css fuer jedes Kopf-Segment (Naht +
+  // Rand von --target-base bzw. --target-md abgezogen), nicht dieses Modul.
+  const page = readFileSync(new URL('../public/pages/documents.js', import.meta.url), 'utf8');
+  assert.match(page, /<div class="segmented segmented--icons documents-view-toggle" role="group"/, 'das Segment der Shell');
+  assert.match(page, /class="segmented__item documents-view-toggle__btn\$\{state\.view === 'grid' \? ' is-active' : ''\}"/, 'Eintraege der Shell, aktiv per is-active');
+  const own = [...eachRule(css)].filter((rule) => /\.documents-view-toggle(?:__btn(?:--active)?)?$/.test(rule.selector.trim())
+    && /(?:^|[;{\s])(?:background|box-shadow|border-radius|padding|width|height)\s*:/.test(rule.body));
+  assert.deepEqual(own.map((r) => r.selector.trim()), [], 'keine eigene Pille, Flaeche oder Hoehe mehr');
+  const panel = readFileSync(new URL('../public/styles/panel.css', import.meta.url), 'utf8');
+  const item = [...eachRule(panel)].find((r) => r.selector.trim() === '.page-toolbar .segmented__item' && !r.at.length);
+  assert.match(item?.body ?? '', /min-height:\s*calc\(var\(--target-base\) - 4 \* var\(--space-px\)\)/, 'Kopf-Segment aussen so hoch wie ein Kopfknopf');
 });
 
 test('der Ordner-Kebab ist immer sichtbar, ruhig in Tertiaerfarbe', () => {
@@ -1254,10 +1289,10 @@ test('die Karte hebt sich beim Hover wie jede interaktive Karte - leise und nie 
   assert.doesNotMatch(base.body, /background/);
   assert.ok(hover.some((rule) => rule.at.some((at) => /prefers-reduced-motion:\s*reduce/.test(at))
     && /transform:\s*none/.test(rule.body)), 'reduzierte Bewegung: keine Anhebung');
-  // Der Zoom bleibt der kleinen Zeilenkachel; auf der grossen Vorschau schnitte er den Briefkopf an.
-  const zoom = [...eachRule(css)].filter((rule) => /scale\(1\.06\)/.test(rule.body));
-  assert.ok(zoom.length > 0);
-  for (const rule of zoom) assert.match(rule.selector, /^\.document-row__icon\.document-thumb--ready:hover/);
+  // Kein Zoom mehr, nirgends: er gehoerte der 42px-Vorschau der Zeile, und die
+  // traegt seit R18 (2026-10-07) das Kategorie-Glyph.
+  const zoom = [...eachRule(css)].filter((rule) => /scale\(1\.0[1-9]\)/.test(rule.body));
+  assert.deepEqual(zoom.map((rule) => rule.selector), []);
 });
 
 test('Speicher-Badges sind Ortsetiketten: neutral, Kapsel, unterschieden durch Glyphe und Text', () => {
@@ -1330,14 +1365,17 @@ test('Einzel-Archivieren meldet einen Fehler statt ihn zu verschlucken', () => {
   // als unbehandelte Rejection durch, ohne Meldung, mit Erfolgs-Annahme.
   const run = fnBody('runDocumentAction', 'deleteDocuments');
   const branch = run.slice(run.indexOf("if (action === 'archive')"), run.indexOf("if (action === 'push-dms')"));
-  assert.match(branch, /try \{[\s\S]*api\.patch\(`\/documents\/\$\{doc\.id\}\/archive`[\s\S]*\} catch \(err\) \{[\s\S]*showToast\(err\.data\?\.error \?\? t\('common\.unknownError'\), 'danger'\)/);
+  // Seit #1909 sagt reportError den Satz der App statt des Servertexts; was
+  // der Toast dann zeigt, faehrt test:documents-errors am echten Handler.
+  assert.match(branch, /try \{[\s\S]*api\.patch\(`\/documents\/\$\{doc\.id\}\/archive`[\s\S]*\} catch \(err\) \{[\s\S]*reportError\(err, \{ owner \}\)/);
 });
 
 test('die Leermeldung nennt den Suchbegriff so, wie er getippt wurde', () => {
   // Gesucht "Kassenbon", gemeldet "kassenbon": die Seite zitierte ihre
   // normalisierte Vergleichsform statt der Eingabe.
-  const empty = fnBody('emptyStateFor', 'renderEmptyState');
-  assert.match(empty, /t\('documents\.emptySearchDescription', \{ query: state\.queryText \}\)/);
+  // Der Begriff steht seit R19 als Chip im geteilten Leerzustand - roh, wie
+  // getippt (queryText), nicht in der Vergleichsform.
+  assert.match(page, /mountSearchEmpty\(list, \{\s*query: state\.queryText,/);
   assert.match(page, /state\.queryText = String\(value \?\? ''\)\.trim\(\);/);
   assert.match(fnBody('clearSearch', 'resetFilters'), /state\.queryText = '';/);
   // Leeren zeichnet auch die Zaehler neu: sie zaehlen unter der Suche, und
@@ -1560,7 +1598,7 @@ test('der Ordner-Kebab nennt seinen Ordner', () => {
   // Re-Critique P2: sieben Mal "Ordneraktionen" ohne Namen hintereinander.
   const tree = page.slice(page.indexOf('function renderFolderBrowser()'), page.indexOf('// Der Auslöser trägt den Ordner, in dem man steht'));
   // rowActionHtml escaped label und Attribute selbst.
-  assert.match(tree, /rowActionHtml\(\{ icon: 'more-vertical', className: 'documents-folder-item__menu', label: t\('documents\.folderActionsFor', \{ name: item\.name \}\), attrs: \{ 'data-folder-menu': item\.id, title: t\('documents\.folderActionsFor', \{ name: item\.name \}\)/);
+  assert.match(tree, /rowActionHtml\(\{ icon: 'ellipsis', className: 'documents-folder-item__menu', label: t\('documents\.folderActionsFor', \{ name: item\.name \}\), attrs: \{ 'data-folder-menu': item\.id, title: t\('documents\.folderActionsFor', \{ name: item\.name \}\)/);
   assert.doesNotMatch(page, /t\('documents\.folderActions'\)/);
   for (const file of LOCALES) {
     const docs = localeData(file).documents;
@@ -1685,7 +1723,9 @@ test('eine Ansicht ohne ein einziges Dokument zeigt keine Facetten-Moebel', () =
   assert.match(tree, /const showCounts = state\.allDocuments\.length > 0;/);
   assert.match(tree, /\$\{showCounts \? `<span class="documents-folder-item__count">/);
   // Und die Spur verschwindet samt Haarlinie, wenn keine Gruppe einen Chip traegt.
-  const spur = [...eachRule(css)].find((r) => r.at.length === 0 && r.selector === '.documents-filters__chips:not(:has(.filter-chip))');
+  // Der Ordner-Chip (Critique 2026-10-16) zaehlt dabei nicht als Facette: am
+  // Desktop ist er ausgeblendet, unter 1024px traegt er die Spur allein.
+  const spur = [...eachRule(css)].find((r) => r.at.length === 0 && r.selector === '.documents-filters__chips:not(:has(.filter-chip:not(.documents-folder-chip)))');
   assert.ok(spur && /display:\s*none/.test(spur.body), 'leere Chip-Spur ausblenden');
 });
 
@@ -1923,4 +1963,58 @@ test('der Betrachter ist schmal vollflaechig, und der Meta-Block klappt hinter d
   assert.match(viewer, /classList\.toggle\('document-viewer--info-open', open\)/);
   // Der Hinweis bleibt im Markup: SPEC.md (D#1014) sagt ihn zu.
   assert.match(viewer, /class="document-viewer__note"/);
+});
+
+// --------------------------------------------------------
+// R18 (2026-10-07): Betrachter ohne fremde Werkzeugleiste, Luft unter der Filterleiste
+
+test('R18: der PDF-Betrachter am Desktop blendet die Leiste des Browsers aus, der neue Tab behaelt sie', () => {
+  // R19: die ganze Seite statt der Breite (FitH zeigte am Desktop ~44 % der Seite).
+  assert.match(page, /const PDF_EMBED_FRAGMENT = '#toolbar=0&navpanes=0&view=Fit&zoom=page-fit';/);
+  const viewer = page.slice(page.indexOf('function renderViewerContent('), page.indexOf('function renderViewerContent(') + 2200);
+  assert.match(viewer, /<iframe class="document-viewer__pdf" src="\$\{previewUrl\}\$\{PDF_EMBED_FRAGMENT\}"/,
+    'das Fragment haengt an der Adresse des eingebetteten Betrachters');
+  // "In neuem Tab oeffnen" traegt die nackte Adresse - dort bleiben Zoom und Druck des Browsers.
+  assert.match(page, /rowActionHtml\(\{ icon: 'external-link', href: previewUrl,/);
+  assert.equal((page.match(/PDF_EMBED_FRAGMENT/g) ?? []).length, 2, 'das Fragment steht nur am iframe, an keinem Link');
+});
+
+test('R18: zwischen Filterleiste und Inhalt steht Luft', () => {
+  const layout = topRules(css).find((rule) => rule.selector === '.documents-browser-layout');
+  assert.match(layout.body, /padding-top:\s*var\(--space-4\)/, 'Ordnerspalte und erste Kartenreihe beginnen nicht auf der Trennlinie');
+});
+
+// Critique 2026-10-16 (P2 mobil): der Ordner-Umschalter stand unter 1024px als
+// eigene 48px-Zeile zwischen Filterzeile und Liste (erstes Dokument y=216). Er
+// ist jetzt der erste Chip der Chip-Spur; zugeklappt belegt die Ordnerauswahl
+// keine Zeile (erstes Dokument y=152 bei 390x844).
+test('Dokumente mobil: der Ordner-Umschalter ist der erste Chip der Filterzeile (Critique 2026-10-16)', () => {
+  const spur = page.slice(page.indexOf('<div class="documents-filters__chips">'), page.indexOf('<div class="documents-browser-layout">'));
+  const chip = spur.indexOf('id="documents-folder-toggle"');
+  assert.ok(chip > -1, 'der Auslöser steht in der Chip-Spur');
+  assert.ok(chip < spur.indexOf('id="documents-expiring-filter"') && chip < spur.indexOf('id="documents-category"'), 'und zwar als erster Chip');
+  assert.match(spur, /class="filter-chip filter-chip--sm documents-folder-chip" id="documents-folder-toggle" type="button"\s+aria-expanded="false" aria-controls="documents-folder-browser">/,
+    'Chip-Haut, Zustand und Ziel des Aufklappens');
+  assert.equal((page.match(/id="documents-folder-toggle"/g) ?? []).length, 1, 'genau EIN Auslöser');
+  assert.match(page, /toggleAttribute\('data-folder-active', Boolean\(state\.folderId\)\)/, 'ein gewaehlter Ordner zeigt sich am Chip');
+  const rules = [...eachRule(css)];
+  const tablet = (r) => r.at.some((a) => /max-width:\s*1023px/.test(a));
+  assert.ok(rules.some((r) => r.at.length === 0 && r.selector.trim() === '.documents-folder-chip' && /display:\s*none/.test(r.body)),
+    'am Desktop kein Ordner-Chip - dort steht die Spalte');
+  assert.ok(rules.some((r) => tablet(r) && r.selector.trim() === '.documents-folder-chip' && /display:\s*inline-flex/.test(r.body)));
+  assert.ok(rules.some((r) => tablet(r) && r.selector.trim() === '.documents-folder-browser:not(.documents-folder-browser--open)' && /display:\s*none/.test(r.body)),
+    'zugeklappt belegt die Ordnerauswahl keine Zeile');
+});
+
+// Re-Critique 2026-10-17 (A4 P2-3, P3): im Raster klemmte die leere Suche in
+// einer Zelle (203px von 860 bei 1440), und ein zweizeiliger Titel liess die
+// Karten einer Reihe in Stufen enden (394/414px).
+test('R20: der Leerzustand nimmt im Raster die ganze Breite, und der Titel haelt zwei Zeilen', () => {
+  const rules = [...eachRule(css)];
+  const empty = rules.find((r) => r.selector.trim() === '.documents-list--grid > .documents-empty-state');
+  assert.ok(empty, 'keine Regel fuer den Leerzustand im Raster');
+  assert.match(empty.body, /grid-column:\s*1\s*\/\s*-1/);
+  const title = rules.find((r) => r.selector.trim() === '.documents-list--grid .document-card__title');
+  assert.ok(title, 'keine Rasterregel fuer den Kartentitel');
+  assert.match(title.body, /min-block-size:\s*2lh/, 'ein einzeiliger Titel haelt die zweite Zeile frei');
 });

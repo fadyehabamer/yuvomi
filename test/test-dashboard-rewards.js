@@ -379,7 +379,9 @@ test('Belohnungen: eine Kante fuer alle Reiter - die Seite fuehrt das breite Mas
     .replace(/\/\*[\s\S]*?\*\//g, '');
   assert.match(page, /class="rewards-page app-page app-page--dashboard app-page--columns" data-composition="dashboard"/,
     'die Seitenwurzel fuehrt das breite Mass und ist der Container der Spalten');
-  assert.match(page, /<header class="page-toolbar page-toolbar--narrow rewards-toolbar">/,
+  // R19: dazu `page-toolbar--tabs-title` (die Reiter stehen unter 1024px in
+  // der Titelzeile) - die Kante haengt weiter an --narrow.
+  assert.match(page, /<header class="page-toolbar page-toolbar--narrow\b[^"]*\brewards-toolbar">/,
     '--narrow bleibt: der Kopf endet am Mass der Seite, in jedem Reiter am selben');
   assert.equal(rewardsPage.syncToolbarMeasure, undefined, 'kein Umschalter am Kopf mehr');
   assert.doesNotMatch(page, /rewards-toolbar--wide/, 'der Kopf-Modifier je Reiter ist weg');
@@ -722,6 +724,91 @@ test('Genehmigungsliste: der Saldo kommt mit der Anfrage, nicht aus der Teilnehm
   }
 });
 
+/** Ein Inhaltsknoten, der dazu merkt, was `wireOverview` an welchen Knopf haengt. */
+function wiredEl() {
+  const el = markupEl();
+  el.clicks = new Map();
+  el.querySelector = (selector) => {
+    const cls = selector.startsWith('.') ? selector.slice(1) : null;
+    // Nur ein Knopf, den das Markup wirklich traegt, laesst sich verdrahten.
+    if (!cls || !new RegExp(`class="[^"]*\\b${cls}\\b`).test(el.html)) return null;
+    return { addEventListener: (type, fn) => { if (type === 'click') el.clicks.set(cls, fn); } };
+  };
+  return el;
+}
+
+test('Uebersicht: "Bonus vergeben" steht im Kopf der Punktestaende und oeffnet den Bonus-Dialog (#1787)', async () => {
+  // Der Bonus war nur ueber den FAB im Reiter Verlauf zu erreichen; Eltern
+  // suchen ihn dort, wo die Punktestaende stehen.
+  const { setPermissions, clearPermissions } = await import('../public/permissions.js');
+  const s = rewardsPage.state;
+  const vorher = { user: s.user, overview: s.overview, catalog: s.catalog, redemptions: s.redemptions, open: globalThis.__openModal };
+  const dialoge = [];
+  globalThis.__openModal = (options) => { dialoge.push(options); };
+  const kopf = (html) => (html.match(/<div class="rw-section__head">\s*<h2[^>]*>rewards\.standings<\/h2>([\s\S]*?)<\/div>\s*<ul class="row-carrier rw-standings">/) || [])[1];
+  try {
+    s.user = { id: 1, role: 'admin' };
+    s.overview = { me: 1, balances: [{ id: 2, display_name: 'Emma', balance: 30 }] };
+    s.catalog = [];
+    s.redemptions = [];
+
+    const el = wiredEl();
+    rewardsPage.renderOverview(el);
+    const head = kopf(el.html);
+    assert.ok(head, 'Vorbedingung: der Kopf der Punktestaende steht da');
+    const knoepfe = [...head.matchAll(/<button class="([^"]*)" type="button">[\s\S]*?<\/i>([^<]*)<\/button>/g)].map(([, cls, label]) => ({ cls, label }));
+    assert.deepEqual(knoepfe.map((k) => k.label), ['rewards.manageParticipants', 'rewards.grantBonus'],
+      'zwei beschriftete Kopfaktionen, der Bonus am Ende');
+    assert.match(knoepfe[1].cls, /\bbtn--secondary\b/, 'der Bonus ist die staerkere der beiden');
+    assert.match(knoepfe[0].cls, /\bbtn--ghost\b/, 'Teilnehmer verwalten bleibt leise');
+    assert.equal((el.html.match(/rw-grant-bonus/g) || []).length, 1, 'genau EIN Knopf - keiner je Personenzeile');
+
+    assert.equal(typeof el.clicks.get('rw-grant-bonus'), 'function', 'der Knopf ist verdrahtet');
+    el.clicks.get('rw-grant-bonus')({ type: 'click' });
+    assert.equal(dialoge.length, 1, 'ein Klick oeffnet einen Dialog');
+    assert.equal(dialoge[0].title, 'rewards.grantBonus');
+    assert.match(dialoge[0].content, /id="rw-bonus-form"/, 'und zwar den vorhandenen Bonus-Dialog');
+    assert.match(dialoge[0].content, /<option value="2">Emma/);
+
+    // Kind: weder Knopf noch Verdrahtung.
+    s.user = { id: 2, role: 'member' };
+    const kind = wiredEl();
+    rewardsPage.renderOverview(kind);
+    assert.ok(kopf(kind.html) !== undefined, 'Vorbedingung: das Kind sieht die Punktestaende');
+    assert.doesNotMatch(kind.html, /rw-grant-bonus|rewards\.grantBonus/);
+    assert.equal(kind.clicks.has('rw-grant-bonus'), false);
+
+    // Nur lesen: der Zustand bleibt, die Handlung geht - auch fuer ein Elternteil.
+    s.user = { id: 1, role: 'admin' };
+    setPermissions({ admin: false, modules: { rewards: 'read' }, widgets: {}, capabilities: {} });
+    try {
+      const ro = wiredEl();
+      rewardsPage.renderOverview(ro);
+      assert.match(ro.html, /rewards\.standings/);
+      assert.doesNotMatch(ro.html, /rw-grant-bonus|rewards\.grantBonus/);
+    } finally {
+      clearPermissions();
+    }
+
+    // Ohne Teilnehmende gibt es keinen Kopf und damit keinen Knopf (gewollt).
+    const { installMiniDom } = await import('./mini-dom.js');
+    const domZurueck = installMiniDom();
+    try {
+      s.overview = { me: 1, balances: [], setup: { participantCount: 0, catalogCount: 1, pointedTaskCount: 1 } };
+      const leer = wiredEl();
+      rewardsPage.renderOverview(leer);
+      assert.match(leer.html, /rewards\.emptyOverviewTitle/);
+      assert.doesNotMatch(leer.html, /rw-grant-bonus/);
+    } finally {
+      domZurueck();
+    }
+  } finally {
+    const { open, ...rest } = vorher;
+    Object.assign(s, rest);
+    globalThis.__openModal = open;
+  }
+});
+
 test('Uebersicht ohne Teilnehmende: die offene Anfrage steht trotzdem da und ist entscheidbar (#1623)', async () => {
   // Der haerteste Fall: die Anfragende war die LETZTE Teilnehmende und wurde
   // ausgetragen. `balances` ist leer, die Uebersicht kehrte mit dem
@@ -770,5 +857,86 @@ test('Uebersicht ohne Teilnehmende: die offene Anfrage steht trotzdem da und ist
   } finally {
     Object.assign(s, vorher);
     domZurueck();
+  }
+});
+
+// R19 (Critique 2026-10-16, Persona Emma): die eigenen Punkte eines Kindes
+// standen als zweite Zeile unter denen des Bruders, an der Faltkante. Wer
+// selbst sammelt und kein Elternteil ist, sieht oben "Deine Punkte" mit dem
+// Weg zur naechsten Praemie; die Punktestaende nennen die anderen.
+test('R19: ein Kind sieht oben die eigene Karte "Deine Punkte", Eltern nicht', () => {
+  const s = rewardsPage.state;
+  const vorher = { user: s.user, overview: s.overview, catalog: s.catalog, ledger: s.ledger, redemptions: s.redemptions, recentLedger: s.recentLedger };
+  try {
+    s.overview = { me: 3, balances: [{ id: 2, display_name: 'Leo', balance: 60 }, { id: 3, display_name: 'Emma', balance: 30 }] };
+    s.catalog = [{ id: 7, name: 'Zocken', cost: 40, is_active: 1 }];
+    s.ledger = []; s.redemptions = []; s.recentLedger = [];
+    s.user = { id: 3, role: 'member' };
+    const kind = markupEl();
+    rewardsPage.renderOverview(kind);
+    const own = kind.html.indexOf('rewards.yourPoints');
+    assert.ok(own > 0, 'die eigene Karte steht da');
+    assert.ok(own < kind.html.indexOf('rewards.standings'), 'vor den Punktestaenden der anderen');
+    const ownList = kind.html.slice(own, kind.html.indexOf('</section>', own));
+    // R20: die eigene Karte nennt den Stand, nicht den eigenen Namen - die
+    // Ueberschrift "Deine Punkte" sagt schon, wessen er ist.
+    assert.match(ownList, /data-countup="30"/, 'mit dem eigenen Stand');
+    assert.match(ownList, /rw-progress__track/, 'und dem Weg zur naechsten Praemie');
+    const rest = kind.html.slice(kind.html.indexOf('rewards.standings'));
+    assert.doesNotMatch(rest, /aria-label="Emma,/, 'die eigene Zeile steht nicht doppelt');
+    s.user = { id: 1, role: 'admin' };
+    const eltern = markupEl();
+    rewardsPage.renderOverview(eltern);
+    assert.doesNotMatch(eltern.html, /rewards\.yourPoints/, 'Eltern sehen die gleichwertige Liste');
+  } finally {
+    Object.assign(s, vorher);
+  }
+});
+
+// R20 (Kinder-Standards): wer selbst sammelt, sieht oben seine eigene Karte -
+// Stand, naechstes Ziel mit Name und Preis, Balken, und die Handlung nur,
+// wenn der Stand fuer eine Praemie reicht. Keine Rangzeile mit einem Eintrag.
+test('Belohnungen: das Kind sieht seine eigene Karte "Deine Punkte -> naechste Praemie" vor den anderen', () => {
+  const s = rewardsPage.state;
+  const vorher = { user: s.user, overview: s.overview, catalog: s.catalog, ledger: s.ledger, redemptions: s.redemptions, recentLedger: s.recentLedger };
+  try {
+    s.user = { id: 3, role: 'member', family_role: 'child' };
+    s.overview = { me: 3, balances: [{ id: 3, display_name: 'Emma', balance: 30 }, { id: 4, display_name: 'Leo', balance: 60 }] };
+    s.catalog = [
+      { id: 7, name: 'Kinoabend', icon: '🎬', cost: 40, is_active: 1 },
+      { id: 8, name: 'Zoo', cost: 120, is_active: 1 },
+    ];
+    s.redemptions = [];
+    s.recentLedger = [];
+    let el = markupEl();
+    rewardsPage.renderOverview(el);
+    const own = el.html.indexOf('class="rw-own"');
+    const others = el.html.indexOf('rewards.standings');
+    assert.ok(own > 0, 'die eigene Karte steht da');
+    assert.ok(own < others, 'vor den Punktestaenden der anderen');
+    const card = el.html.slice(own, others);
+    assert.match(card, /rw-own__value" data-countup="30"/, 'der eigene Stand als grosse Zahl');
+    assert.match(card, /rw-own__target-name">Kinoabend</, 'das naechste Ziel mit Namen');
+    assert.match(card, /rw-own__target-cost">rewards\.pointsCount|rw-own__target-cost">[^<]*40/, 'und seinem Preis');
+    assert.match(card, /role="progressbar"[^>]*aria-valuenow="75"/, '30 von 40 - der Weg als Balken');
+    assert.doesNotMatch(card, /rw-redeem-open/, '30 reicht fuer nichts: kein Einloese-Knopf');
+    assert.match(card, /rw-own__history/, 'der eigene Verlauf bleibt erreichbar');
+    assert.doesNotMatch(card, /rw-standing__id/, 'keine Rangzeile in der eigenen Karte');
+    assert.doesNotMatch(el.html.slice(others), /data-member="3"/, 'unten stehen nur die anderen');
+
+    // Reicht der Stand, steht die Handlung als Primaerknopf in der Karte.
+    s.overview.balances[0].balance = 45;
+    el = markupEl();
+    rewardsPage.renderOverview(el);
+    assert.match(el.html, /class="btn btn--primary rw-redeem-open" type="button" data-member="3"/);
+
+    // Der Elternteil sieht keine eigene Karte, sondern alle Staende.
+    s.user = { id: 1, role: 'admin' };
+    s.overview.me = 1;
+    el = markupEl();
+    rewardsPage.renderOverview(el);
+    assert.doesNotMatch(el.html, /class="rw-own"/);
+  } finally {
+    Object.assign(s, vorher);
   }
 });

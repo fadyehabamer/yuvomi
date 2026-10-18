@@ -62,7 +62,7 @@ function withAccess(modules, fn) {
   try { return fn(); } finally { clearPermissions(); }
 }
 
-const ohneKommentare = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+const ohneKommentare = (src) => src.replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
 const BUDGET_CODE = ohneKommentare(readFileSync(new URL('../public/pages/budget.js', import.meta.url), 'utf8'));
 const PLANS_CODE = ohneKommentare(readFileSync(new URL('../public/pages/budget-plans.js', import.meta.url), 'utf8'));
 const ABOS_CODE = ohneKommentare(readFileSync(new URL('../public/pages/subscriptions.js', import.meta.url), 'utf8'));
@@ -189,6 +189,30 @@ test('Buchungszeile mit `budget: read`: jede Handlung geht, die Zeile oeffnet di
   });
 });
 
+test('Kategorie- und Unterkategoriefilter bleiben mit `budget: read` lesende Aktionen', () => {
+  withAccess({ budget: 'read' }, () => {
+    const html = buchungsTab([
+      buchung({ id: 17, category: 'housing', subcategory: 'rent_mortgage' }),
+      buchung({ id: 19, title: 'Nebenkosten', category: 'housing', subcategory: 'utilities' }),
+      buchung({ id: 18, title: 'Lebensmittel', category: 'food', subcategory: 'groceries' }),
+    ], {
+      categoryFilter: 'housing',
+      subcategoryFilter: { category: 'housing', key: 'rent_mortgage' },
+      meta: {
+        expenseCategories: [
+          { key: 'housing', name: 'Wohnen' },
+          { key: 'food', name: 'Lebensmittel' },
+        ],
+        incomeCategories: [],
+        subcategories: { housing: [{ key: 'rent_mortgage', name: 'Miete' }, { key: 'utilities', name: 'Nebenkosten' }] },
+      },
+    });
+    assert.match(html, /data-id="17"/);
+    assert.doesNotMatch(html, /data-id="18"/);
+    assert.match(html, /data-subcategory-filter="rent_mortgage"/);
+  });
+});
+
 test('Leere Buchungsliste mit `budget: read`: nur der Titel, kein CTA und keine Anleitung zum Anlegen', () => {
   withAccess({ budget: 'write' }, () => {
     const html = budget.renderEntries();
@@ -294,9 +318,10 @@ test('Darlehenskarte mit `budget: read`: Bearbeiten, Loeschen und Rate buchen we
     assert.doesNotMatch(html, /loan-edit|loan-delete|loan-pay/);
     assert.doesNotMatch(html, /budget-loan-card__actions/);
     assert.match(html, /data-action="loan-filter"/, 'der Raten-Filter liest nur');
-    // Ein Umschalter, der seinen Zustand ansagt, als geteilte Zeilenaktion mit
-    // dem Darlehen im Namen (Komponenten-Kanon 2026-09-26).
-    assert.match(html, /<button type="button" class="row-action budget-loan-card__filter" data-action="loan-filter" aria-label="budget\.filterLoanNamed\{&quot;name&quot;:&quot;Autokredit&quot;\}" data-id="9" aria-pressed="false">/);
+    // Ein Umschalter, der seinen Zustand ansagt - seit D6 (Critique 2026-10-16)
+    // als Eintrag mit Haken im Mehr-Knopf der Karte, der das Darlehen nennt.
+    assert.match(html, /class="row-action row-action--more budget-loan-card__more popover-menu__trigger"[^>]*aria-label="common\.moreActionsNamed\{&quot;name&quot;:&quot;Autokredit&quot;\}"/);
+    assert.match(html, /role="menuitemcheckbox" aria-checked="false"[\s\S]{0,120}data-action="loan-filter" data-id="9"/);
     assert.match(html, /role="progressbar"/);
     assert.match(html, /Autokredit/);
     assert.match(html, /budget\.loanNextDue/);
@@ -598,7 +623,7 @@ test('Gruppe mit `budget: read`: keine Handlung, aber Salden, Ausgaben und Verla
     assert.doesNotMatch(html, /splitExpenses\.editExpense/);
     assert.match(html, /Urlaub Ostsee/);
     assert.match(html, /Ferienwohnung/);
-    assert.match(html, /splitExpenses\.owes/);
+    assert.match(html, /splitExpenses\.debt(?:Owes|YouOwe|OwesYou)\{/, 'der Saldo steht da (R20: ein Satz je Sicht)');
   });
 });
 
@@ -809,8 +834,8 @@ test('Geteilte Ausgaben: Kopfknopf und Gruppe-Anlegen haengen am Recht', () => {
 // -------------------------------------------------------------------------
 
 test('READ_SAFE_ACTIONS ist eine Positivliste und enthaelt nur lesende Aktionen', () => {
-  assert.deepEqual([...budget.READ_SAFE_ACTIONS], ['loan-filter', 'toggle-planned'],
-    'der Raten-Filter und der Aufklapper von "Geplant" (R17/E4) sind die lesenden `data-action` dieser Seite');
+  assert.deepEqual([...budget.READ_SAFE_ACTIONS], ['loan-filter', 'toggle-planned', 'toggle-loan-payments'],
+    'der Raten-Filter und die Aufklapper von "Geplant" (R17/E4) und der Raten (R20) sind die lesenden `data-action` dieser Seite');
   const alle = new Set([...BUDGET_CODE.matchAll(/data-action="([a-z-]+)"/g)].map((m) => m[1]));
   // Untergrenze nur als Blindheits-Probe: seit R14 P8 stehen Loeschen und
   // Bearbeiten in den Blaettern, die Seite traegt 7 Aktionsnamen.
@@ -1652,4 +1677,103 @@ test('Plan: kein zweites „+ Budget festlegen" im Koerper - der Budget-FAB ruft
   }
 });
 
+test('Abo: the payment reminder switch defaults on and displays a saved off choice', () => {
+  for (const reminderEnabled of [undefined, true, false]) {
+    const subscription = abo({ reminder_enabled: reminderEnabled });
+    const editor = withAccess({ budget: 'write' }, () => modalOptionen(() => abos.openSubscriptionModal(subscription)));
+    const toggle = editor.content.match(/<input[^>]*id="subscription-reminder-enabled"[^>]*>/)?.[0];
+    assert.ok(toggle, 'the dialog includes the reminder switch');
+    assert.match(toggle, /role="switch"/);
+    assert.equal(/\bchecked\b/.test(toggle), reminderEnabled !== false);
+    const days = editor.content.match(/<input[^>]*id="subscription-reminder"[^>]*>/)[0];
+    assert.equal(/\bdisabled\b/.test(days), reminderEnabled === false);
+    const detail = zeilen(abos.subscriptionReadSections(subscription));
+    assert.equal(detail['subscriptions.reminderDaysLabel'], reminderEnabled === false
+      ? 'subscriptions.noReminder' : 'subscriptions.reminderMeta{"count":3}');
+    const card = withAccess({ budget: 'read' }, () => abos.renderCard(subscription));
+    assert.equal(card.includes('subscriptions.reminderMeta'), reminderEnabled !== false);
+    assert.equal(card.includes('subscriptions.noReminder'), reminderEnabled === false);
+    const reminderIcon = reminderEnabled === false ? 'bell-off' : 'bell';
+    assert.ok(card.includes(`data-lucide="${reminderIcon}"`));
+    const reminderRow = abos.subscriptionReadSections(subscription)
+      .find(row => row.label === 'subscriptions.reminderDaysLabel');
+    assert.equal(reminderRow.icon, reminderIcon);
+  }
+});
+
+test('Abo: changing the reminder switch disables and re-enables the days field', () => {
+  for (const subscription of [null, abo({ reminder_enabled: true }), abo({ reminder_enabled: false })]) {
+    const editor = withAccess({ budget: 'write' }, () => modalOptionen(() => abos.openSubscriptionModal(subscription)));
+    const nodes = new Map();
+    const panel = { querySelector(selector) {
+      if (!nodes.has(selector)) nodes.set(selector, Object.assign(new EventTarget(), {
+        value: '', querySelector: (child) => panel.querySelector(child), querySelectorAll: () => [],
+      }));
+      return nodes.get(selector);
+    } };
+    const toggle = panel.querySelector('#subscription-reminder-enabled');
+    const days = panel.querySelector('#subscription-reminder');
+    toggle.checked = subscription?.reminder_enabled !== false;
+    days.disabled = !toggle.checked;
+    days.value = '7';
+    editor.onSave(panel);
+    for (const checked of [!toggle.checked, toggle.checked]) {
+      toggle.checked = checked;
+      toggle.dispatchEvent(new Event('change'));
+      assert.equal(days.disabled, !checked, 'the days field follows the switch after a change');
+      assert.equal(days.value, '7', 'switching reminders preserves the chosen lead time');
+    }
+  }
+});
+
+test('Abo: saving sends the reminder switch for both new and existing subscriptions', async () => {
+  const previousApi = globalThis.__apiStub;
+  const previousWindow = globalThis.window;
+  globalThis.window = { yuvomi: { showToast() {} } };
+  setPermissions({ admin: false, modules: { budget: 'write' }, widgets: {}, capabilities: {} });
+  try {
+    for (const existing of [null, abo({ id: 42 })]) {
+      for (const checked of [false, true]) {
+        let request;
+        const capture = async (url, body) => {
+          request = { url, body };
+          throw new Error('Request captured before modal reload');
+        };
+        globalThis.__apiStub = { post: capture, put: capture };
+        const values = {
+          '#subscription-next-date': '2026-10-08', '#subscription-currency': 'EUR',
+          '#subscription-end-type': 'never', '#subscription-amount': '9.99',
+          '#subscription-name': 'Test subscription', '#subscription-cycle': 'monthly',
+          '#subscription-interval': '1', '#subscription-reminder': '3',
+        };
+        const nodes = new Map();
+        const panel = { querySelector(selector) {
+          if (!nodes.has(selector)) nodes.set(selector, { value: values[selector] ?? '', files: [],
+            checked: selector === '#subscription-reminder-enabled' ? checked : true });
+          return nodes.get(selector);
+        } };
+        await abos.saveSubscription(panel, existing);
+        assert.ok(request, 'the dialog must send a save request');
+        assert.equal(request.url, existing ? '/budget/subscriptions/42' : '/budget/subscriptions');
+        assert.equal(request.body.reminder_enabled, checked);
+        assert.equal(request.body.reminder_days, 3);
+      }
+    }
+  } finally {
+    clearPermissions();
+    globalThis.window = previousWindow;
+    if (previousApi === undefined) delete globalThis.__apiStub;
+    else globalThis.__apiStub = previousApi;
+  }
+});
+
 test.after(() => miniDomAbraeumen());
+
+// R20 (Re-Critique 2026-10-17, A4 P3): eine feste Miete ist am Ersten zu 100 %
+// gebucht und stand den Monat ueber in Bernstein. Genau auf Plan ist keine Warnung.
+test('R20: genau auf Plan ist kein "knapp" - kurz davor schon, darueber rot', () => {
+  assert.equal(plans.toneForRatio(1, false), 'under', 'feste Kosten, genau getroffen');
+  assert.equal(plans.toneForRatio(0.9, false), 'near');
+  assert.equal(plans.toneForRatio(0.5, false), 'under');
+  assert.equal(plans.toneForRatio(1.2, true), 'over');
+});

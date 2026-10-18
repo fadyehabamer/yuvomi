@@ -109,7 +109,8 @@ export function recipeHeroEl({ recipeId, hasOwnImage, className = 'recipe-detail
   img.alt = '';
   img.loading = 'lazy';
   img.decoding = 'async';
-  img.addEventListener('error', () => { frame.remove(); }, { once: true });
+  // Seit R20 ohne Ersatz (das Band aus R18 ist weg): der Rahmen geht mit.
+  img.addEventListener('error', () => frame.remove(), { once: true });
   frame.appendChild(img);
   return frame;
 }

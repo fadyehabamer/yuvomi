@@ -7,6 +7,8 @@
  * behauptete bis 2026-08-31 "Cache-First" für Shell und Seitenmodule):
  *   Navigation + APP_SHELL + PAGE_MODULES + Locales: Network-First mit dem
  *        Precache (install) als Offline-Fallback - frisch, solange Netz da ist.
+ *        Antwortet das Netz nicht binnen NETWORK_FIRST_DEADLINE_MS, kommt der
+ *        Cache-Treffer; die Netzantwort fuellt den Cache trotzdem nach.
  *   ASSETS (Bilder, Icons) und der Rest-Fallback: Cache-First, lazily gecacht,
  *        bei SW-Update geleert
  *   API: Network-First für eine Read-only-GET-Whitelist (Kalender, Tasks, …)
@@ -17,7 +19,7 @@
  *   → bypassCacheUntil (in-memory + Cache API für SW-Restart-Robustheit)
  */
 
-const APP_RELEASE        = '2.74.0';
+const APP_RELEASE        = '2.78.0';
 const APP_BUILD_REVISION = '__YUVOMI_BUILD_REVISION__';
 const CACHE_RELEASE      = `${APP_RELEASE}-${APP_BUILD_REVISION}`;
 const SHELL_CACHE        = `yuvomi-shell-${CACHE_RELEASE}`;
@@ -32,7 +34,10 @@ const ALL_CACHES    = [SHELL_CACHE, PAGES_CACHE, LOCALES_CACHE, ASSETS_CACHE];
 
 // GET-API-Pfade (nach /api/v1), die für Read-only-Offline gecacht werden dürfen.
 // NUR Lese-Endpunkte — niemals /auth/* oder Mutationen. Prefix-Match.
-const API_CACHE_WHITELIST = ['/calendar', '/tasks', '/shopping', '/contacts', '/dashboard'];
+// `/people` sind die Profilbilder (server/routes/people.js): Aufgaben, Termine
+// und Uebersicht tragen ihre Adresse statt der Data-URL, offline braucht die
+// Zeile ihr Bild aus demselben Cache.
+const API_CACHE_WHITELIST = ['/calendar', '/tasks', '/shopping', '/contacts', '/dashboard', '/people'];
 // Pfade UNTER einem Whitelist-Prefix, die trotzdem nie gecacht werden.
 const API_CACHE_EXCLUDE = ['/shopping/versions'];
 
@@ -42,6 +47,7 @@ const APP_SHELL = [
   '/index.html',
   '/api.js',
   '/lang-init.js',
+  '/boot-fetch.js',
   '/router.js',
   '/i18n.js',
   '/rrule-ui.js',
@@ -97,6 +103,7 @@ const APP_SHELL = [
   // Seitenmodul träfe sonst auf die alte Fassung (#616). Sortierung wie im
   // Dateisystem; Fetch-Routing für diese Pfade → SHELL_CACHE (isMutableAppResource).
   '/nav-icons.js',
+  '/utils/app-update.js',
   '/permissions.js',
   // Der Router laedt ihn als Seiteneffekt (`import '/components/datepicker.js'`),
   // also gehoert er in die Shell, nicht zu den Seitenmodulen. Der
@@ -112,6 +119,7 @@ const APP_SHELL = [
   '/components/user-multi-select.js',
   '/components/wall-timer.js',
   '/utils/birthday-event.js',
+  '/utils/budget-category-colors.js',
   '/utils/bulk-pill.js',
   '/utils/category-labels.js',
   '/utils/chart.js',
@@ -134,16 +142,19 @@ const APP_SHELL = [
   '/utils/document-folder-delete.js',
   '/utils/document-preview.js',
   '/utils/event-color.js',
+  '/utils/event-icon.js',
   '/utils/empty-state.js',
   '/utils/extension-i18n.js',
   '/utils/extension-widgets.js',
   '/utils/fab.js',
   '/utils/flip.js',
   '/utils/list-motion.js',
+  '/utils/component-style.js',
   '/utils/content-swap.js',
   '/utils/filter-sheet.js',
   '/utils/folder-upload.js',
   '/utils/folder-tree.js',
+  '/utils/form-row.js',
   '/utils/friendly-error.js',
   '/utils/health-activity.js',
   '/utils/health-cycle.js',
@@ -166,6 +177,7 @@ const APP_SHELL = [
   '/utils/household.js',
   '/utils/html-escape.js',
   '/utils/html.js',
+  '/utils/ingredient-match-key.js',
   '/utils/ingredient-row.js',
   '/utils/initials.js',
   '/utils/inventory-warranty.js',
@@ -174,6 +186,8 @@ const APP_SHELL = [
   '/utils/korean-particles.js',
   '/utils/leave-guard.js',
   '/utils/live-feed.js',
+  '/utils/loan-order.js',
+  '/utils/ledger-order.js',
   '/utils/markdown-checklist.js',
   '/utils/markdown-toolbar.js',
   '/utils/master-detail.js',
@@ -191,6 +205,8 @@ const APP_SHELL = [
   '/utils/note-category-overflow.js',
   '/utils/note-category-picker.js',
   '/utils/overlay-history.js',
+  '/utils/overlay-host.js',
+  '/utils/dialog-surface.js',
   '/utils/page-layout.js',
   '/utils/page-lifecycle.js',
   '/utils/page-search.js',
@@ -222,10 +238,12 @@ const APP_SHELL = [
   '/utils/screensaver-idle.js',
   '/utils/scroll-restore.js',
   '/utils/seal-pair.js',
+  '/utils/session-unreachable.js',
   '/utils/segment-indicator.js',
   '/utils/sheet-drag.js',
   '/utils/shopping-categories.js',
   '/utils/skeleton.js',
+  '/utils/start-handoff.js',
   '/utils/sub-tabs.js',
   '/utils/swipe-row.js',
   '/utils/sync-target.js',
@@ -235,6 +253,7 @@ const APP_SHELL = [
   '/utils/toast-placement.js',
   '/utils/toast-show.js',
   '/utils/toast-surface.js',
+  '/utils/background-inert.js',
   '/utils/today-sheet.js',
   '/utils/unknown-route.js',
   '/utils/page-mount.js',
@@ -263,6 +282,11 @@ const APP_SHELL = [
   '/icons/icon-maskable-512.png',
 ];
 
+// Jede Sprache, die die App kennt. NICHT die Precache-Liste: vorab gecacht
+// wird nur PRECACHED_LOCALES, der Rest kommt beim ersten Abruf in denselben
+// Cache (LOCALES_CACHE). Die Liste hier ist die Zulassung dafuer - der Worker
+// cacht auf Zuruf (CACHE_LOCALE) nur, was in ihr steht. Jede Datei unter
+// public/locales/ gehoert hinein (`test:sw-precache`).
 const APP_LOCALES = [
   '/locales/ar.json',
   '/locales/cs.json',
@@ -291,6 +315,16 @@ const APP_LOCALES = [
   '/locales/vi.json',
   '/locales/zh.json',
 ];
+const APP_LOCALE_SET = new Set(APP_LOCALES);
+
+// VORAB NUR DIE RUECKFALLSPRACHE (Entscheidung 2026-10-07, Critique R18). Bis
+// dahin holte jedes Release alle 26 Sprachdateien, von denen ein Geraet eine
+// benutzt. `de` ist die Sprache, auf die i18n.js zurueckfaellt, und muss
+// offline immer da sein. Die Sprache DIESES Geraets kennt der Worker nicht von
+// selbst - die Seite nennt sie ihm (CACHE_LOCALE, gesendet von i18n.js beim
+// Start, beim Sprachwechsel und wenn ein neuer Worker uebernimmt), und jeder
+// gewoehnliche Abruf legt sie ohnehin ab (networkFirst).
+const PRECACHED_LOCALES = ['/locales/de.json'];
 
 // Seiten-Module: lazy geladen, aber vorab gecacht für Offline.
 // waste.js fehlt hier BEWUSST (Round-3-Review, #1063): wie housekeeping.js
@@ -330,6 +364,7 @@ const PAGE_MODULES = [
   // (Avatare, Geburtstage, Vorrat, Rezepte, Haushaltshilfe, Schnellzugriff).
   // Der Precache-Guard las dynamische Importe bis dahin nicht.
   '/utils/auth-ui.js',
+  '/utils/brand-mark.js',
   '/utils/avatar-crop.js',
   '/utils/lucide-icons.js',
   '/utils/sortable.js',
@@ -353,6 +388,7 @@ const PAGE_MODULES = [
   '/settings/region-presets.js',
   '/settings/weather-location.js',
   '/settings/family-users.js',
+  '/settings/module-install-errors.js',
   '/settings/pages/personal-account.js',
   '/settings/pages/personal-schedule.js',
   '/settings/pages/admin-email.js',
@@ -366,6 +402,7 @@ const PAGE_MODULES = [
   '/settings/pages/personal-calendar.js',
   '/settings/pages/personal-tasks.js',
   '/settings/pages/modules-active.js',
+  '/settings/pages/modules-install.js',
   '/settings/pages/modules-navigation.js',
   '/settings/pages/modules-kitchen.js',
   '/settings/pages/modules-calendar.js',
@@ -419,12 +456,23 @@ const _bypassInit = (async () => {
 
 // --------------------------------------------------------
 // Install: App-Shell + Seiten-Module vorab cachen
-// cache: 'reload' umgeht den HTTP-Cache → immer frische Dateien
+//
+// `no-cache` HEISST REVALIDIEREN, NICHT "OHNE CACHE" (Entscheidung 2026-10-07,
+// Critique R18). Bis dahin stand hier `cache: 'reload'`: jedes Release holte
+// alle rund 300 Dateien neu, auch die, die sich nicht geaendert hatten. Mit
+// `no-cache` fragt der Browser fuer jede Datei mit ihrem ETag nach, und der
+// Server antwortet fuer eine unveraenderte mit 304 ohne Rumpf.
+//
+// DAS IST NUR SICHER, WEIL DER ETAG AUS DEM INHALT KOMMT
+// (server/utils/static-assets.js). Ein ETag aus Groesse und Aenderungszeit, wie
+// express.static ihn sonst bildet, bliebe bei einer gleich langen Aenderung mit
+// gleicher Zeit stehen - und der neue Cache bekaeme die alte Datei. Eine
+// geaenderte Datei MUSS neu kommen; `test:static-assets` haelt genau das.
 // --------------------------------------------------------
 self.addEventListener('install', (event) => {
-  const freshShell   = APP_SHELL.map((url)    => new Request(url, { cache: 'reload' }));
-  const freshModules = PAGE_MODULES.map((url) => new Request(url, { cache: 'reload' }));
-  const freshLocales = APP_LOCALES.map((url) => new Request(url, { cache: 'reload' }));
+  const freshShell   = APP_SHELL.map((url)    => new Request(url, { cache: 'no-cache' }));
+  const freshModules = PAGE_MODULES.map((url) => new Request(url, { cache: 'no-cache' }));
+  const freshLocales = PRECACHED_LOCALES.map((url) => new Request(url, { cache: 'no-cache' }));
   event.waitUntil(
     Promise.all([
       caches.open(SHELL_CACHE).then((c) => c.addAll(freshShell)),
@@ -493,7 +541,7 @@ self.addEventListener('fetch', (event) => {
           // Im Bypass-Fenster (nach SW-Update) API-Requests nicht anfassen:
           // frisch ans Netz, weder aus Cache bedienen noch hineinschreiben.
           if (Date.now() < bypassCacheUntil) return fetch(request);
-          return networkFirstApi(request);
+          return networkFirstApi(request, event);
         })
       );
     }
@@ -506,15 +554,15 @@ self.addEventListener('fetch', (event) => {
   // damit bypassCacheUntil korrekt gesetzt ist bevor wir entscheiden.
   if (!_bypassInitDone) {
     event.respondWith(
-      _bypassInit.then(() => dispatchFetch(request, url))
+      _bypassInit.then(() => dispatchFetch(request, url, event))
     );
     return;
   }
 
-  event.respondWith(dispatchFetch(request, url));
+  event.respondWith(dispatchFetch(request, url, event));
 });
 
-function dispatchFetch(request, url) {
+function dispatchFetch(request, url, event) {
   // Nach SW-Update: direkt vom Netz, kein SW-Cache, kein HTTP-Cache.
   // Gilt für ALLE Requests (JS, CSS, Images, HTML) im Bypass-Fenster.
   if (Date.now() < bypassCacheUntil) {
@@ -536,11 +584,11 @@ function dispatchFetch(request, url) {
   }
 
   if (request.mode === 'navigate') {
-    return networkFirst(request, SHELL_CACHE);
+    return networkFirst(request, SHELL_CACHE, event);
   }
 
   if (url.pathname.startsWith('/locales/')) {
-    return networkFirst(request, LOCALES_CACHE);
+    return networkFirst(request, LOCALES_CACHE, event);
   }
 
   // Lazy geladene Seiten-Module liegen in PAGES_CACHE. Neben /pages/ gehören dazu
@@ -556,11 +604,11 @@ function dispatchFetch(request, url) {
     url.pathname.startsWith('/settings/') ||
     PAGE_MODULE_SET.has(url.pathname)
   ) {
-    return networkFirst(request, PAGES_CACHE);
+    return networkFirst(request, PAGES_CACHE, event);
   }
 
   if (url.origin === self.location.origin && isMutableAppResource(url.pathname)) {
-    return networkFirst(request, SHELL_CACHE);
+    return networkFirst(request, SHELL_CACHE, event);
   }
 
   if (isAsset(url.pathname) && url.origin === self.location.origin) {
@@ -571,17 +619,97 @@ function dispatchFetch(request, url) {
 }
 
 // --------------------------------------------------------
-// Strategie: Network-First (für Navigation Requests)
+// Strategie: Network-First mit Frist (Navigation, Shell, Seitenmodule,
+// Stylesheets, Locales)
+//
+// EIN NETZ, DAS NICHT "OFFLINE" MELDET, ABER NICHT ANTWORTET (Critique R18).
+// Bis dahin wartete jede dieser Anfragen, bis `fetch` von selbst aufgab - im
+// Zug, im Aufzug, am Rand des WLAN haengt der Start dann minutenlang, obwohl
+// alles im Cache liegt. Jetzt laeuft das Netz gegen eine Frist:
+//
+//   - antwortet es rechtzeitig, gilt seine Antwort (Network-First bleibt die
+//     Strategie, siehe Dateikopf);
+//   - laeuft die Frist ab und es gibt einen Cache-Treffer fuer GENAU diese
+//     Anfrage, kommt der. Das Netz laeuft weiter und legt seine Antwort in den
+//     Cache - der naechste Abruf hat sie;
+//   - ohne Treffer wird weiter aufs Netz gewartet, wie vorher.
+//
+// DIE FRIST KOSTET EINMAL, NICHT JE DATEI. Die Shell ist ein Modulgraph: der
+// Browser erfaehrt die naechste Ebene erst aus der vorigen, und mit einer Frist
+// je Anfrage wartete ein Start an jeder Ebene erneut 1,5 s (gemessen mit
+// angehaltenem Server: nach 9 s noch kein Router). Reisst eine Anfrage die
+// Frist, gilt das Netz deshalb fuer SLOW_NETWORK_WINDOW_MS als langsam: wer in
+// dieser Zeit einen Cache-Treffer hat, bekommt ihn sofort, und das Netz fuellt
+// im Hintergrund nach. Danach wird wieder gemessen. Das haelt auch zusammen,
+// was zusammengehoert: nach dem ersten Treffer aus dem Cache kommt der Rest
+// des Starts aus demselben Cache statt halb vom Netz.
+//
+// DER TREFFER IST DIE ANFRAGE SELBST - mit einer Ausnahme: eine Navigation auf
+// eine Route der App. Der Server beantwortet jede davon mit `index.html`
+// (SPA-Fallback in server/index.js), im Cache liegt aber nur, was schon einmal
+// als Dokument geladen wurde; ein Neuladen auf `/tasks` wartete sonst weiter
+// aufs Netz (gemessen). Was KEINE Route der App ist, bekommt den Ersatz nur
+// beim Ausfall (catch unten), nie nach der Frist: eine Navigation auf einen
+// Feed oder eine Datei bekaeme sonst nach 1,5 s die App-Shell statt ihrer
+// Antwort. Die Grenze zieht isAppRouteNavigation().
+//
+// DAS BYPASS-FENSTER NACH EINEM SW-UPDATE LAEUFT NICHT HIER DURCH
+// (dispatchFetch): dort gilt keine Frist, alles kommt frisch vom Netz. Und der
+// Mischzustand aus #616 bleibt, was er war: zwischen einem Server-Update und
+// der Uebernahme durch den neuen Worker kann eine Seite alte und neue Dateien
+// sehen - vorher, wenn einzelne Abrufe ausfielen, jetzt auch, wenn einzelne die
+// Frist reissen. Dafuer gibt es den Reload in importPage() (router.js) und, fuer
+// eine Shell, die gar nicht erst startet, den in sw-register.js.
 // --------------------------------------------------------
-async function networkFirst(request, cacheName) {
+const NETWORK_FIRST_DEADLINE_MS = 1500;
+const SLOW_NETWORK_WINDOW_MS = 10000;
+const DEADLINE_PASSED = Symbol('deadline');
+let slowNetworkUntil = 0;
+
+async function networkFirst(request, cacheName, event) {
   const cache = await caches.open(cacheName);
 
-  try {
-    const response = await fetch(request);
+  // Das Ablegen haelt die Antwort nicht auf, wird aber gemerkt: nach der Frist
+  // muss der Worker so lange leben, bis es durch ist.
+  let stored = Promise.resolve();
+  const network = fetch(request).then((response) => {
     if (response.ok && response.type === 'basic') {
-      cache.put(request, response.clone());
+      stored = Promise.resolve(cache.put(request, response.clone())).catch(() => {});
     }
     return response;
+  });
+
+  // Das Netz laeuft weiter und fuellt den Cache nach. `waitUntil` haelt den
+  // Worker dafuer am Leben; ein spaeter Fehler ist dann keiner mehr.
+  const serveCached = (cached) => {
+    const refill = network.then(() => stored, () => {});
+    if (event && typeof event.waitUntil === 'function') event.waitUntil(refill);
+    return cached;
+  };
+
+  const cachedCopy = async () => (
+    await cache.match(request)
+      || (isAppRouteNavigation(request) ? cache.match('/index.html') : undefined)
+  );
+
+  let timer;
+  try {
+    if (Date.now() < slowNetworkUntil) {
+      const cached = await cachedCopy();
+      if (cached) return serveCached(cached);
+    }
+
+    const deadline = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(DEADLINE_PASSED), NETWORK_FIRST_DEADLINE_MS);
+    });
+    const first = await Promise.race([network, deadline]);
+    if (first !== DEADLINE_PASSED) return first;
+
+    const cached = await cachedCopy();
+    if (!cached) return await network;
+
+    slowNetworkUntil = Date.now() + SLOW_NETWORK_WINDOW_MS;
+    return serveCached(cached);
   } catch {
     const cached = await cache.match(request);
     if (cached) return cached;
@@ -596,7 +724,64 @@ async function networkFirst(request, cacheName) {
       status: 503,
       headers: { 'Content-Type': 'text/plain; charset=utf-8' },
     });
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+// --------------------------------------------------------
+// Profilbilder einer gecachten Liste (server/routes/people.js)
+// --------------------------------------------------------
+const AVATAR_PATH_RE = /^\/api\/v1\/people\/\d+\/avatar$/;
+const AVATAR_URL_RE = /^\/api\/v1\/people\/\d+\/avatar\?v=[0-9a-f]{32}$/;
+// NUR DIESE FELDER, dieselben wie AVATAR_FIELDS in
+// server/services/person-avatar.js (test:sw-api-cache haelt beide gleich). Ein
+// Titel oder eine Beschreibung mit eingetippten Bildpfaden loeste sonst je
+// Treffer einen Abruf aus, bei jedem Laden wieder (Codex-Review zu #2056).
+const AVATAR_FIELDS = new Set([
+  'assigned_avatar', 'avatar_data', 'creator_avatar', 'worker_avatar_data', 'user_avatar', 'person_avatar',
+]);
+
+/** Die Bildadressen aus den Bildfeldern einer Antwort, jede einmal. */
+function avatarPathsIn(value, found = new Set()) {
+  if (Array.isArray(value)) {
+    for (const item of value) avatarPathsIn(item, found);
+  } else if (value && typeof value === 'object') {
+    for (const [key, inner] of Object.entries(value)) {
+      if (AVATAR_FIELDS.has(key)) {
+        if (typeof inner === 'string' && AVATAR_URL_RE.test(inner)) found.add(inner);
+      } else {
+        avatarPathsIn(inner, found);
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * Legt die Profilbilder, deren Adresse in einer Listen-Antwort steht, in den
+ * API-Cache - nur aus den Bildfeldern, jede Adresse einmal, auch wenn sie in
+ * hundert Zeilen steht, und nur, wenn sie noch nicht dort liegt (die Adresse
+ * wechselt mit dem Bild).
+ * @param {string} baseUrl Adresse der Liste, gegen die die Pfade aufgeloest werden
+ * @param {string} text Rumpf der Liste
+ */
+async function precacheAvatars(baseUrl, text) {
+  let body;
+  try { body = JSON.parse(text); } catch { return; }
+  const paths = [...avatarPathsIn(body)];
+  if (!paths.length) return;
+  const cache = await caches.open(API_CACHE);
+  await Promise.all(paths.map(async (path) => {
+    const url = new URL(path, baseUrl).href;
+    if (await cache.match(url)) return;
+    try {
+      const res = await fetch(url, { credentials: 'same-origin' });
+      if (res.ok && res.type === 'basic') await cache.put(url, res);
+    } catch {
+      // Offline oder abgewiesen: beim naechsten Laden der Liste wieder.
+    }
+  }));
 }
 
 // --------------------------------------------------------
@@ -604,7 +789,7 @@ async function networkFirst(request, cacheName) {
 // Erfolg → Antwort klonen, x-cached-at-Header ergänzen, in API_CACHE legen.
 // Netzfehler → Cache-Fallback, sonst 503-JSON {error:'offline'}.
 // --------------------------------------------------------
-async function networkFirstApi(request) {
+async function networkFirstApi(request, event) {
   try {
     const response = await fetch(request);
     // Nur erfolgreiche, gleichoriginäre (basic) Antworten cachen.
@@ -619,6 +804,15 @@ async function networkFirstApi(request) {
         statusText: cloned.statusText,
         headers,
       }));
+      // Bilder, deren Adresse in der Liste steht, gleich mitnehmen - sonst
+      // fehlt offline jedes, dessen Zeile nie auf dem Schirm war
+      // (loading="lazy"). Die Liste wartet nicht darauf, das fetch-Event
+      // schon: `waitUntil` haelt den Worker am Leben, bis die Bilder im Cache
+      // liegen - sonst darf der Browser ihn nach der Antwort beenden.
+      if (!AVATAR_PATH_RE.test(new URL(request.url).pathname)) {
+        const prefetch = response.clone().text().then((text) => precacheAvatars(request.url, text)).catch(() => {});
+        if (event && typeof event.waitUntil === 'function') event.waitUntil(prefetch);
+      }
     }
     return response;
   } catch {
@@ -656,6 +850,22 @@ function isAsset(pathname) {
   return /\.(png|jpg|jpeg|ico|svg|webp|woff2?|gif)$/i.test(pathname);
 }
 
+/**
+ * Ist das eine Navigation auf eine Route der App - also eine, die der Server
+ * mit `index.html` beantwortet? Die App-Routen kennt der Worker nicht, wohl
+ * aber, was KEINE ist: alles mit Dateiendung, die Feeds, der MCP-Endpunkt und
+ * die API-Dokumentation `/docs` (eigene Server-Route, server/index.js; ein
+ * langsamer Server gaebe dem Admin sonst die Shell statt der Dokumentation).
+ * `/api/` erreicht diese Stelle gar nicht erst.
+ */
+function isAppRouteNavigation(request) {
+  if (request.mode !== 'navigate') return false;
+  const { pathname } = new URL(request.url);
+  if (pathname.startsWith('/feed/') || pathname === '/mcp' || pathname.startsWith('/mcp/')) return false;
+  if (pathname === '/docs' || pathname.startsWith('/docs/')) return false;
+  return !/\.[a-z0-9]+$/i.test(pathname);
+}
+
 function isMutableAppResource(pathname) {
   return pathname === '/'
     || pathname === '/index.html'
@@ -680,6 +890,23 @@ function isCacheableApiGet(pathname) {
 // Nachrichten vom Client: API-Cache leeren (Logout/Session-Ende)
 // --------------------------------------------------------
 self.addEventListener('message', (event) => {
+  // Die Seite nennt die Sprache dieses Geraets (i18n.js), damit sie offline da
+  // ist, auch wenn ihr Abruf am Worker vorbeiging: beim Erstbesuch (noch kein
+  // Controller) und im Bypass-Fenster nach einem Update (dort wird nichts
+  // abgelegt). Nur zugelassene Dateien, und nur, wenn sie noch fehlt.
+  if (event.data && event.data.type === 'CACHE_LOCALE') {
+    const path = `/locales/${event.data.locale}.json`;
+    if (!APP_LOCALE_SET.has(path)) return;
+    event.waitUntil(
+      caches.open(LOCALES_CACHE)
+        .then(async (cache) => {
+          if (await cache.match(path)) return;
+          await cache.add(new Request(path, { cache: 'no-cache' }));
+        })
+        .catch(() => { /* offline oder Speicher voll: beim naechsten Abruf */ }),
+    );
+    return;
+  }
   if (event.data && event.data.type === 'CLEAR_API_CACHE') {
     // QUITTIEREN, WENN DER ABSENDER EINEN PORT MITSCHICKT. Ohne Rueckmeldung
     // weiss die Seite nie, wann der Cache wirklich weg ist, und ein sofortiges

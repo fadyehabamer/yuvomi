@@ -2,7 +2,7 @@
  * Modul: Bausteine der Auth-Seiten (auth-ui)
  * Zweck: EIN Kopf, EIN Passwortfeld, EIN Fehlerfeld fuer Anmeldung,
  *        Ersteinrichtung, Einladung und Passwort-Reset.
- * Abhaengigkeiten: /utils/html.js
+ * Abhaengigkeiten: /utils/html.js, /utils/brand-mark.js
  *
  * WARUM (Critique 2026-10-05, R16 "Bausteine werden nicht vererbt"): die fuenf
  * Seiten vor der Anmeldung bauten dieselben drei Dinge je selbst.
@@ -17,6 +17,7 @@
  *   alert ist assertiv) und beides gemischt.
  */
 import { esc } from '/utils/html.js';
+import { brandMarkSvg } from '/utils/brand-mark.js';
 
 const DEFAULT_APP_NAME = 'Yuvomi';
 const APP_NAME_STORAGE_KEY = 'yuvomi-app-name';
@@ -46,15 +47,7 @@ export function authHeroHtml({ appName = getStoredAppName(), tagline = '', headi
   const tag = heading ? 'h1' : 'p';
   return `
       <div class="auth-hero${heading ? '' : ' auth-hero--compact'}">
-        <span class="auth-hero__mark" aria-hidden="true">
-          <svg viewBox="0 0 160 160" fill="currentColor">
-            <g fill-opacity="0.82">
-              <circle cx="64" cy="72" r="27" />
-              <circle cx="100" cy="78" r="25" />
-              <circle cx="80" cy="106" r="24" />
-            </g>
-          </svg>
-        </span>
+        <span class="auth-hero__mark" aria-hidden="true">${brandMarkSvg()}</span>
         <${tag} class="auth-hero__title">${esc(appName)}</${tag}>
         ${tagline ? `<p class="auth-hero__tagline">${esc(tagline)}</p>` : ''}
       </div>`;
@@ -110,4 +103,69 @@ export function wirePasswordToggle(input, { show, hide }) {
     if (window.lucide) window.lucide.createIcons({ el: toggle });
   });
   return toggle;
+}
+
+/**
+ * DIE PASSWORTREGEL VOR DEM ERSTEN VERSUCH (Modern-Web-Guidance-Audit,
+ * Befund 15). Einrichtung, Einladung und Reset nannten "mindestens 8 Zeichen"
+ * erst als Fehler, nachdem man abgeschickt hatte. Der Hinweis steht unter dem
+ * neuen Passwort, das Feld zeigt per `aria-describedby` auf ihn.
+ *
+ * @param {string} id    die id, auf die das Feld zeigt
+ * @param {string} text  schon uebersetzt
+ */
+export function passwordRuleHtml(id, text) {
+  return `<p class="auth-form__hint" id="${esc(id)}">${esc(text)}</p>`;
+}
+
+/**
+ * DER FEHLER STEHT AM FELD, nicht nur im Fehlerfeld oben: `aria-invalid` und
+ * ein `aria-describedby` auf die Meldung (ein vorhandener Hinweis bleibt
+ * davor stehen). Die naechste Eingabe in diesem Feld nimmt beides zurueck.
+ *
+ * @param {HTMLElement|null} field
+ * @param {HTMLElement|null} errorEl  das Fehlerfeld aus `authErrorHtml()`
+ */
+export function flagField(field, errorEl) {
+  if (!field || !errorEl?.id) return;
+  field.setAttribute('aria-invalid', 'true');
+  const ids = (field.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean);
+  if (!ids.includes(errorEl.id)) field.setAttribute('aria-describedby', [...ids, errorEl.id].join(' '));
+  if (field._authFlagged) return;
+  field._authFlagged = true;
+  // Wer das Feld korrigiert, nimmt die Meldung mit - auf JEDER Seite, nicht nur
+  // dort, wo ein eigener Eingabe-Handler sie ausblendet: auf Einladung und Reset
+  // stand "stimmt nicht ueberein" sonst bis zum naechsten Absenden da
+  // (Codex-Review zu #2059). Ohne Formular nur dieses Feld.
+  field.addEventListener('input', () => {
+    if (field.form) hideAuthError(field.form, errorEl);
+    else unflagField(field, errorEl);
+  }, { once: true });
+}
+
+/** Nimmt Markierung und Verweis auf die Meldung von EINEM Feld. */
+function unflagField(field, errorEl) {
+  field._authFlagged = false;
+  field.removeAttribute('aria-invalid');
+  const rest = (field.getAttribute('aria-describedby') || '').split(/\s+/).filter((id) => id && id !== errorEl.id);
+  if (rest.length) field.setAttribute('aria-describedby', rest.join(' '));
+  else field.removeAttribute('aria-describedby');
+}
+
+/**
+ * MELDUNG WEG, MARKIERUNGEN WEG - zusammen (Codex-Review zu #2059). Blendete
+ * eine Seite ihr Fehlerfeld bei der ersten Eingabe aus, blieben die ANDEREN
+ * markierten Felder `aria-invalid` und zeigten auf eine Meldung, die niemand
+ * mehr sah. Wer die Meldung ausblendet, nimmt hiermit jede Markierung ab, die
+ * auf sie zeigt.
+ *
+ * @param {HTMLElement|null} form
+ * @param {HTMLElement|null} errorEl
+ */
+export function hideAuthError(form, errorEl) {
+  if (!errorEl) return;
+  errorEl.hidden = true;
+  for (const field of form?.querySelectorAll?.('[aria-invalid="true"]') ?? []) {
+    if ((field.getAttribute('aria-describedby') || '').split(/\s+/).includes(errorEl.id)) unflagField(field, errorEl);
+  }
 }

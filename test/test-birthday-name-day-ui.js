@@ -174,18 +174,32 @@ test('Liste + Detail: jede Zeile ist fuer den Baustein waehlbar, der Hauptknopf 
   assert.match(html, /<button type="button" class="list-row__main list-row__main--interactive" data-open="4" data-md-focus>/);
 });
 
-test('Liste + Detail: die Spalte nennt wann und wie alt, Datum, Notiz - und ein Bild nur, wenn es eins gibt', async () => {
+test('Liste + Detail: die Spalte nennt wann und wie alt, Datum, Notiz - und fuehrt Bild und Kennzahlen im Kopf (R18)', async () => {
   const { installMiniDom } = await import('./mini-dom.js');
   const restore = installMiniDom();
   try {
     const rows = birthdays.__test.birthdayPaneSections(BD);
     const byLabel = Object.fromEntries(rows.map((r) => [r.label, r]));
-    assert.equal(byLabel['birthdays.photoLabel'].node, null, 'ohne Bild keine Initialen-Scheibe als „Profilbild"');
-    assert.match(rows[1].value, /birthdays\.ageNoteDays/, 'die Auskunft, die die Zeile nur knapp traegt');
+    // Seit R18 steht das Bild im KOPF der Ansicht (birthdayDetailHead), nicht
+    // mehr als Zeile "Profilbild". Die Zeile gab es ohne Bild nicht, weil eine
+    // Initialen-Scheibe kein Profilbild ist; der Kopf behauptet das nicht - er
+    // zeigt die Person, als Bild oder als Monogramm wie die Kontaktkarte.
+    assert.equal(byLabel['birthdays.photoLabel'], undefined, 'keine Zeile „Profilbild" mehr');
+    // R19 (Critique 2026-10-16, "das Detail sagt dasselbe dreimal"): keine
+    // Zeile "Wird in 36 Tagen 41 Jahre alt." mehr - Alter und Abstand stehen
+    // im Kopf, das Datum als seine Unterzeile.
+    assert.ok(!rows.some((r) => /birthdays\.ageNote/.test(String(r.value)) || r.icon === 'party-popper'), 'keine dritte Fassung von Alter und Abstand');
+    const head = birthdays.__test.birthdayDetailHead(BD);
+    assert.ok(head.subtitle, 'das Datum des naechsten Geburtstags steht als Unterzeile im Kopf');
+    assert.ok(head.media, 'der Kopf fuehrt immer ein Bild oder Monogramm');
+    assert.deepEqual(head.facts, ['birthdays.turnsAge{"age":41}', 'birthdays.inDays{"count":36}'], 'dieselben Worte wie die Kachel der Uebersicht: wie alt, wann');
+    assert.deepEqual(birthdays.__test.birthdayDetailHead({ ...BD, next_age: null, days_until: 0 }).facts, ['', 'common.today'],
+      'ohne Geburtsjahr kein Alter; heute heisst heute');
     assert.ok(byLabel['birthdays.birthDateLabel'].value, 'Geburtsdatum');
     assert.equal(byLabel['birthdays.notesLabel'].value, 'Bruder in Hamburg');
-    const withPhoto = birthdays.__test.birthdayPaneSections({ ...BD, photo_data: 'data:image/png;base64,AA' });
-    assert.ok(withPhoto[0].node, 'mit Bild steht es oben');
+    const src = readFileSync(new URL('../public/pages/birthdays.js', import.meta.url), 'utf8');
+    assert.equal(src.match(/head: birthdayDetailHead\(birthday\),/g)?.length, 2, 'Spalte und Blatt fuehren denselben Kopf');
+    assert.doesNotMatch(src, /accentColor: 'var\(--module-birthdays\)'/, 'kein frei stehender Farbstreifen mehr');
   } finally { restore(); }
   assert.equal(birthdays.__test.renderBirthdayPane('999', null), false, 'unbekannte ID: Leerzustand (Rueckgabe-Vertrag)');
 });
@@ -203,4 +217,22 @@ test('Liste + Detail: Seite, Markup, Klickweg und die klebende Spalte', () => {
   assert.match(block, /position: sticky;/);
   assert.match(block, /height: calc\(var\(--viewport-height\) - var\(--birthdays-detail-top/,
     'die Hoehe rechnet ab der gemessenen Oberkante - sonst ragt sie in Ruhe unter den Falz');
+});
+
+// R19 (Critique 2026-10-16): Monatsgruppen in der Liste, und der naechste
+// Geburtstag fuehrt im Modulton.
+test('R19: die Liste gruppiert nach Monat und hebt den naechsten hervor', async () => {
+  const { installMiniDom } = await import('./mini-dom.js');
+  const restore = installMiniDom();
+  try {
+    const row = (id, next) => ({ id, name: `P${id}`, next_birthday: next, days_until: id * 10, next_age: 30, birth_date: '1990-01-01' });
+    const html = birthdays.__test.birthdayListHtml([row(1, '2026-11-02'), row(2, '2026-11-20'), row(3, '2027-02-08')]);
+    const heads = [...html.matchAll(/<h2 class="list-group__title birthdays-month">([^<]*)<\/h2>/g)].map((m) => m[1]);
+    assert.equal(heads.length, 2, `ein Kopf je Monat: ${heads.join(', ')}`);
+    assert.ok(html.indexOf(heads[1]) > html.indexOf('data-id="2"'), 'der zweite Kopf steht vor dem Februar, nach beiden Novembern');
+    assert.equal((html.match(/birthday-item--next/g) ?? []).length, 1, 'genau einer ist der naechste');
+    assert.ok(html.indexOf('birthday-item--next') < html.indexOf('data-id="2"'), 'und zwar der erste');
+  } finally { restore(); }
+  const css = readFileSync(new URL('../public/styles/birthdays.css', import.meta.url), 'utf8');
+  assert.match(css, /\.birthday-item--next \.birthday-chip \{[^}]*--module-accent/, 'der Countdown des naechsten im Modulton');
 });

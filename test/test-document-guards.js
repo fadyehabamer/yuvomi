@@ -276,6 +276,45 @@ async function visitViews(page, where, visit) {
   }
 }
 
+/**
+ * Die Sichten, die nur im Werkzeugmenue waehlbar sind (D1, Critique 2026-10-16).
+ *
+ * Unter 768px steht die Ansichtswahl einiger Module nicht als Segment im Kopf,
+ * sondern als Einfachauswahl im "..."-Menue (Aufgaben Liste/Brett, Dokumente
+ * Raster/Liste) - der Umschalter ist dort ausgeblendet, und `visitViews` sieht
+ * nur, was sichtbar ist. Ohne diesen Weg erreichte Sonde 7 das Board mobil nie
+ * mehr, und die Ausnahme `kanban-card` stand ohne Fundstelle da.
+ *
+ * Geklickt wird der Menue-Eintrag selbst (`[data-view-choice]`), also derselbe
+ * Weg, den die App geht - ueber den delegierten Handler des Kopfs, nicht ueber
+ * Speicher-Schluessel. Nur Eintraege, deren Gruppe in dieser Breite gilt (ab
+ * 768px blendet das Modul die Gruppe aus, dann waehlt das Segment). Danach
+ * zurueck auf die Ausgangssicht: die Wahl wird gespeichert und traefe sonst die
+ * naechste Route.
+ */
+async function visitMenuViews(page, where, visit) {
+  const choices = await page.evaluate(() => [...document.querySelectorAll('.popover-menu__item[data-view-choice]')]
+    .filter((item) => {
+      const group = item.closest('.popover-menu__group') ?? item;
+      return getComputedStyle(group).display !== 'none';
+    })
+    .map((item) => ({ view: item.dataset.viewChoice, on: item.getAttribute('aria-checked') === 'true' })));
+  const start = choices.find((c) => c.on)?.view;
+  if (!start) return;
+  const pick = (view) => page.evaluate((v) => {
+    const item = document.querySelector(`.popover-menu__item[data-view-choice="${CSS.escape(v)}"]`);
+    if (!item) return false;
+    item.click();
+    return true;
+  }, view);
+  for (const { view, on } of choices) {
+    if (on || !(await pick(view))) continue;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await visit(`${where}:menu-${view}`);
+  }
+  if (await pick(start)) await new Promise((resolve) => setTimeout(resolve, 600));
+}
+
 before(async () => {
   harness = await startHarness();
 });
@@ -467,23 +506,33 @@ test('der verspaetete Erstfokus nimmt dem fortgesetzten Speichern-Tor den Fokus 
       return document.activeElement?.id;
     }), 'slow-title', 'ohne spaeter gewaehlten Fokus landet der Erstfokus wie bisher im ersten Feld');
 
-    // Wie das Datepicker-Popover: ein Fokusziel direkt unter body, AUSSERHALB des
-    // Modals, ohne dass das Modal inert wird (Befund aus der claude-review zu #1193).
+    // Wie das Datepicker-Popover: ein Fokusziel AUSSERHALB der Tafel, ohne dass das
+    // Modal inert wird (Befund aus der claude-review zu #1193). Seit D7 ist das
+    // Modal ein natives <dialog> mit showModal(): alles ausserhalb ist inert, ein
+    // Popover direkt unter body nimmt gar keinen Fokus an (gemessen). Echte
+    // Popover haengen deshalb ueber `overlayHost()` im Dialog, neben der Tafel -
+    // genau dort, wo der Datepicker sie hinhaengt. Die Sonde nimmt denselben Weg
+    // und prueft zuerst, dass das Popover den Fokus WIRKLICH hatte; sonst
+    // bestaetigte sie eine Wahl, die nie stattfand.
     await page.evaluate(() => window.slowGate.modal.closeModal({ force: true }));
     await openSlow('Slow editor with a popover');
-    assert.equal(await page.evaluate(async () => {
+    assert.deepEqual(await page.evaluate(async () => {
+      const { overlayHost } = await import('/utils/overlay-host.js');
       const popover = document.createElement('div');
       popover.id = 'slow-popover';
       popover.setAttribute('popover', 'manual');
       popover.tabIndex = -1;
-      document.body.appendChild(popover);
+      overlayHost().appendChild(popover);
       popover.showPopover?.();
       popover.focus();
+      const took = document.activeElement?.id;
+      const outsidePanel = !popover.closest('.modal-panel');
       await new Promise((resolve) => setTimeout(resolve, 2000));
       const focus = document.activeElement?.id;
       popover.remove();
-      return focus;
-    }), 'slow-popover', 'der Erstfokus-Timer darf den Fokus nicht aus einem Popover unter body ziehen');
+      return { took, outsidePanel, focus };
+    }), { took: 'slow-popover', outsidePanel: true, focus: 'slow-popover' },
+    'der Erstfokus-Timer darf den Fokus nicht aus einem Popover ueber der Tafel ziehen');
 
     // Faellt der Fokus nur auf body, weil der Ausloeser weggerendert wurde, ist
     // das keine Wahl: das Modal bekommt seinen Erstfokus trotzdem.
@@ -501,9 +550,9 @@ test('der verspaetete Erstfokus nimmt dem fortgesetzten Speichern-Tor den Fokus 
       return document.activeElement?.id;
     }), 'slow-title', 'ein auf body gefallener Fokus ist keine Wahl - das erste Feld bekommt ihn trotzdem');
 
-    // Tab waehrend der Verzoegerung landet auf der Seite DAHINTER (nicht inert, der
-    // Trap haengt nur am Panel). Das ist keine Wahl: der Fokus muss in den Dialog
-    // (zweite Runde der Review zu #1193).
+    // Tab waehrend der Verzoegerung landete auf der Seite DAHINTER (zweite Runde
+    // der Review zu #1193). Seit D7 ist sie inert und nimmt den Fokus gar nicht
+    // erst; die Zusage bleibt dieselbe: der Fokus muss in den Dialog.
     await page.evaluate(() => {
       window.slowGate.modal.closeModal({ force: true });
       document.getElementById('slow-background')?.remove();
@@ -760,7 +809,9 @@ test('PR2 #975 - das zusammengesetzte Kalenderformular und seine Seriennamen ble
       return {
         repeatLabel: repeat?.getAttribute('aria-label') || '',
         repeatIsSvg: Boolean(repeat?.querySelector('svg')),
-        dayLabel: chip?.closest('.month-day')?.getAttribute('aria-label') || '',
+        // Seit R20 traegt die Zelle ihren Namen als Inhalt (`.month-day__label`,
+        // sr-only), nicht als aria-label - dieselbe Zusammenfassung.
+        dayLabel: chip?.closest('.month-day')?.querySelector('.month-day__label')?.textContent || '',
       };
     }, title);
     assert.ok(monthA11y.repeatLabel, 'die Serienmarke hat nach der Lucide-Ersetzung einen Namen');
@@ -804,6 +855,16 @@ for (const [name, answer] of [
       await gotoRoute(page, '/calendar');
       await page.click('#cal-view-tab-day');
       await page.waitForSelector('#cal-view-tab-day[aria-selected="true"]');
+      // DER WECHSEL MUSS DURCH SEIN (R19): die Ansicht gleitet seither per
+      // View Transition herein (swapRegion, utils/content-swap.js), und
+      // solange sie laeuft, trifft Chromium nur <html> - ein Tipp beendet sie
+      // bloss, der naechste erreicht die Seite. `aria-selected` steht schon,
+      // bevor die Daten der Tagesansicht geladen sind und der Wechsel beginnt;
+      // der FAB-Klick fiel im Handlauf R19 mitten hinein und verpuffte (der
+      // Dialog ging nie auf). Ein Finger tippt nach dem sichtbaren Wechsel,
+      // die Sonde wartet ihn ebenso ab: Tagesansicht steht, Transition vorbei.
+      await page.waitForFunction(() => Boolean(document.querySelector('#cal-body .day-view'))
+        && !document.documentElement.classList.contains('page-swapping'));
       await page.click('#fab-new-event');
       await page.waitForSelector('#modal-title');
       await page.evaluate((eventTitle) => {
@@ -2219,7 +2280,12 @@ test('Sonde 7 - eine Zeilenfolge ist keine Spalte aus Karten', async () => {
       // Auf einem Blatt nur der Zustand selbst - siehe `isLeaf`: zwei der drei
       // Umschaltergruppen in den Einstellungen schreiben eine Einstellung.
       if (isLeaf(name)) await note(name);
-      else await visitViews(page, name, note);
+      else {
+        await visitViews(page, name, note);
+        // Mobil steht Liste/Brett der Aufgaben im Menue (D1) - ohne diesen
+        // Weg saehe die Sonde das Board nur am Desktop.
+        await visitMenuViews(page, name, note);
+      }
     }
     await page.close();
     perDevice.set(device, found);
@@ -2362,6 +2428,7 @@ test('Sonde 8 - ein Kopf mit Lead-Zone traegt seine Linie erst angedockt, und do
   const findings = [];
   let headsSeen = 0;
   let leadHeads = 0;
+  const leadNames = [];
 
   for (const name of sweep('Sonde 8')) {
     await gotoRoute(page, ALL_ROUTES[name]);
@@ -2384,6 +2451,7 @@ test('Sonde 8 - ein Kopf mit Lead-Zone traegt seine Linie erst angedockt, und do
       continue;
     }
     leadHeads += 1;
+    leadNames.push(name);
 
     // EINE LEAD-ZONE AUF EINEM EINZEILIGEN KOPF IST KEINE. Sie kostet dann
     // nicht nur nichts, sie verbirgt die Linie dauerhaft: `--stacked` schaltet
@@ -2427,8 +2495,30 @@ test('Sonde 8 - ein Kopf mit Lead-Zone traegt seine Linie erst angedockt, und do
   // die triviale Haelfte der Regel, und genau die andere war kaputt.
   assert.ok(headsSeen >= ROUTE_NAMES.length - 3,
     `Nur ${headsSeen} Modulkoepfe von ${ROUTE_NAMES.length} Routen gesehen - die Sonde erreicht die Koepfe nicht mehr.`);
-  assert.ok(leadHeads >= 5,
-    `Nur ${leadHeads} Koepfe mit Lead-Zone gesehen (gemessen: 10). Ohne sie prueft diese Sonde nur, `
+  // DIE ZAHL IST GEMESSEN UND SIE SINKT MIT ABSICHT. Die "10" stammte aus der
+  // Zeit vor der Kopfregel 1a (R16): seither stehen die Werkzeuge vieler Koepfe
+  // in der Titelzeile, und ein einzeiliger Kopf hat keine Lead-Zone. Mit D1
+  // (Critique 2026-10-16) wurde auch der Aufgabenkopf einzeilig (120 -> 65px).
+  // Gemessen 2026-10-16 bei 375px (origin/main 5f752e7a2): vier Koepfe mit
+  // Lead-Zone - Kalender, Budget (Zeitraum-Kopf, gedeckelt), Belohnungen,
+  // Haushaltshilfe (Band ueber der Reiterleiste, `--dock-band`).
+  // R19 (68f1c0ef0, Critique 2026-10-16 "Koepfe auf das 65px-Muster"): unter
+  // 1024px stehen die Reiter von Belohnungen und Haushaltshilfe IN der
+  // Titelzeile (`.page-toolbar--tabs-title`), beide Koepfe sind einzeilig
+  // (121/129 -> 65px), tragen ihre Linie durchgehend und haben zu Recht keine
+  // Lead-Zone mehr. Gemessen 2026-10-17 bei 375px, Laufart dieser Sonde: main
+  // 4 (Kalender, Budget, Belohnungen, Haushaltshilfe), R19 2 (Kalender,
+  // Budget). Die Band-Bauart hat in dieser Laufart keine Route mehr; sie haelt
+  // nur noch test:ux-utils. Damit die Untergrenze scharf bleibt, nennt sie die Koepfe:
+  // verliert Kalender oder Budget die Lead-Zone, wird die Sonde rot, auch wenn
+  // ein anderer Kopf eine dazubekommt.
+  for (const name of ['calendar', 'budget']) {
+    assert.ok(leadNames.includes(name),
+      `${name}: keine Lead-Zone mehr gesehen (gemessen 2026-10-17: Kalender und Budget docken an). `
+      + `Gesehen: ${leadNames.join(', ') || 'keiner'}.`);
+  }
+  assert.ok(leadHeads >= 2,
+    `Nur ${leadHeads} Koepfe mit Lead-Zone gesehen (gemessen 2026-10-17: 2). Ohne sie prueft diese Sonde nur, `
     + 'dass einzeilige Koepfe eine Linie tragen.');
 
   assert.deepEqual(findings, [],
@@ -2474,12 +2564,12 @@ test('Sonde 8 - ein Kopf mit Lead-Zone traegt seine Linie erst angedockt, und do
  *
  * DIE SIGNATUR IST DER MASSSTAB, NICHT EINE OBERGRENZE. Die Frage ist nicht
  * „wie viele Ebenen sind zu viele", sondern „waechst die Zahl mit dem Inhalt".
- * Ein einmaliges Chrome-Element (die Sidebar-Pille, der Tab-Indikator, ein
- * Backdrop-Blob) darf sein Versprechen dauerhaft halten - es gibt genau eins
+ * Ein einmaliges Chrome-Element (die Sidebar-Pille, der Tab-Indikator)
+ * darf sein Versprechen dauerhaft halten - es gibt genau eins
  * davon, egal wie lang die Liste wird. Eine Zeile darf es nicht: dieselbe
  * Signatur zweimal heisst, sie kommt auch 200-mal.
  *
- * Genau diese Unterscheidung sieht ein Stylesheet-Scanner nicht: `.lg-blob--1`
+ * Genau diese Unterscheidung sieht ein Stylesheet-Scanner nicht: `.nav-sidebar__indicator`
  * und `.task-card` tragen dieselbe Deklaration.
  */
 // Nur Versprechen, die tatsaechlich eine eigene Ebene erzwingen. `will-change:
@@ -2535,7 +2625,9 @@ test('Sonde 9 - ein Compositor-Versprechen im Ruhezustand ist einmalig, nie eine
   // Eine Sonde, die nichts gesehen hat, darf nicht urteilen (dieselbe
   // Zusicherung wie bei Sonde 3 bis 8). Hier zaehlt BEIDES: die Routen, und
   // dass ueberhaupt Ebenen gefunden werden - die Shell traegt drei einmalige
-  // (Sidebar-Pille, Sidebar-Hover, Tab-Indikator) plus die Backdrop-Blobs.
+  // (Sidebar-Pille, Sidebar-Hover, Tab-Indikator).  Die vier Backdrop-Blobs,
+  // die bis R18 dazukamen, sind gestrichen - die Schwelle unten (eine Ebene je
+  // Route) haelt auch ohne sie.
   // Findet die Sonde gar keine, misst sie den Selektor falsch statt die App.
   assert.ok(routesSeen >= routes.length - 1,
     `Nur ${routesSeen} von ${routes.length} Zustaenden gesehen.`);
@@ -2590,8 +2682,8 @@ test('Sonde 9 - ein Compositor-Versprechen im Ruhezustand ist einmalig, nie eine
  * im synchronen Markup, war aber im Sinne der Sichtbarkeitspruefung nicht da.
  * Ein Guard, der von einer Animation abhaengt, meldet Zufall statt Regel.
  *
- * NUR ENDLICHE Animationen: die Backdrop-Blobs laufen mit
- * `animation: lg-drift 26s infinite alternate` und werden NIE fertig - ein
+ * NUR ENDLICHE Animationen: eine Endlos-Schleife (Spinner, Skelett-Schimmer,
+ * Wetter; bis R18 auch die Backdrop-Blobs) wird NIE fertig - ein
  * naives `Promise.all(getAnimations().map(a => a.finished))` haengt bis zum
  * Timeout der Suite.
  */
@@ -3713,7 +3805,9 @@ describe('Sonde 15 - in der kompakten Hoehe traegt der Kopf hoechstens eine Bedi
  * Leerlauf fielen dadurch 60 auf ~20 fps, bei einem Style-Recalc je Frame; ein
  * Melder sah 100 % GPU auf integrierter Grafik. Die Reparatur trennt beides auf
  * zwei Knoten - die Huelle bewegt sich, das Kind `.lg-blob__ink` traegt den
- * Blur und steht still -, danach standen 60 fps.
+ * Blur und steht still -, danach standen 60 fps. Der Backdrop ist seit R18
+ * (2026-10-07) gestrichen, weil er vollstaendig unter dem opaken Scrollport
+ * lag; die Regel gilt weiter fuer alles, was im Leerlauf laeuft.
  *
  * WARUM NICHT IM STYLESHEET. Die Zuordnung ist dort nicht sichtbar: Filter und
  * Animation koennen in zwei getrennten Regeln stehen (`.lg-blob` und
@@ -3735,12 +3829,28 @@ describe('Sonde 16 - kein dauerlaufendes Element rastert pro Frame einen Filter'
     const offenders = [];
     // Zustaende, in denen die Vorbedingung fehlte - JE ZUSTAND, nicht als Summe.
     const unmeasured = [];
+    const backdropBack = [];
 
     for (const name of sweep('Sonde 16')) {
       await gotoRoute(page, ALL_ROUTES[name]);
       const found = await page.evaluate(() => {
-        const out = { animated: 0, blobs: 0, blobsRunning: 0, offenders: [] };
-        out.blobs = document.querySelectorAll('.lg-blob').length;
+        const out = { animated: 0, shell: false, backdrop: 0, selfTest: false, offenders: [] };
+        // SELBSTPROBE: ein Koeder, der die Regel verletzt (endlos + filter).
+        // Bis R18 bewiesen die vier Backdrop-Blobs in jedem Zustand, dass die
+        // Sonde Endlos-Animationen ueberhaupt liest; seit es sie nicht mehr
+        // gibt, steht in einer ruhenden Seite oft keine einzige. Findet die
+        // Sonde den Koeder nicht, ist sie blind, nicht die Seite sauber.
+        const bait = document.createElement('div');
+        bait.setAttribute('data-probe16-bait', '');
+        bait.style.cssText = 'position:fixed;inline-size:1px;block-size:1px;opacity:0;pointer-events:none;'
+          + 'animation:probe16-bait 1s linear infinite;filter:blur(1px)';
+        document.body.appendChild(bait);
+        // Die Vorbedingung je Zustand: die Shell steht und die Seite ist
+        // aufgebaut. Bis R18 war es der laufende Backdrop - den gibt es nicht
+        // mehr, und kaeme er zurueck, ist das hier der Befund.
+        out.shell = !!document.querySelector('.app-shell')
+          && (document.getElementById('main-content')?.childElementCount ?? 0) > 0;
+        out.backdrop = document.querySelectorAll('.lg-blob, .lg-backdrop').length;
         for (const el of document.querySelectorAll('*')) {
           const cs = getComputedStyle(el);
           // `infinite` liest sich berechnet als 'infinite'; mehrere Animationen
@@ -3753,18 +3863,21 @@ describe('Sonde 16 - kein dauerlaufendes Element rastert pro Frame einen Filter'
             && cs.animationDuration.split(',').some((v) => parseFloat(v) > 0);
           if (!endless || !running) continue;
           out.animated += 1;
-          if (el.classList.contains('lg-blob')) out.blobsRunning += 1;
           const filter = cs.filter;
+          if (el === bait) { out.selfTest = !!filter && filter !== 'none'; continue; }
           if (filter && filter !== 'none') {
             out.offenders.push(`${el.tagName.toLowerCase()}.${el.className || '(ohne Klasse)'} -> ${filter}`);
           }
         }
+        bait.remove();
+        out.animated -= 1;
         return out;
       });
-      if (found.blobs === 0 || found.blobsRunning < found.blobs) {
-        unmeasured.push(`${name}: ${found.blobs} .lg-blob, davon ${found.blobsRunning} endlos animiert `
-          + `(${found.animated} dauerlaufende Animationen insgesamt)`);
+      if (!found.selfTest) unmeasured.push(`${name}: der Koeder (endlos + filter) wurde nicht erkannt`);
+      if (!found.shell) {
+        unmeasured.push(`${name}: keine aufgebaute Shell (${found.animated} dauerlaufende Animationen)`);
       }
+      if (found.backdrop > 0) backdropBack.push(`${name}: ${found.backdrop} Backdrop-Knoten`);
       for (const o of found.offenders) offenders.push(`${name}: ${o}`);
     }
     await page.close();
@@ -3778,19 +3891,23 @@ describe('Sonde 16 - kein dauerlaufendes Element rastert pro Frame einen Filter'
     // konnte nicht sagen, welche Zustaende zu kurz kamen; und ein Lauf, in dem
     // einigen die Shell fehlte, waehrend andere Spinner oder Skelette trugen,
     // blieb gruen, obwohl jene Zustaende nie geprueft waren. Die Vorbedingung
-    // ist der lebende Backdrop, und der steht in JEDEM Zustand: mindestens ein
-    // `.lg-blob`, und jeder davon laeuft endlos. Fehlt er, nennt die Meldung
-    // den Zustand - die Zahl der Blobs kommt aus dem Dokument, nicht von hier.
+    // war bis R18 der lebende Backdrop (in JEDEM Zustand vier endlos laufende
+    // `.lg-blob`). Er ist gestrichen; seither ist die Vorbedingung je Zustand
+    // die aufgebaute Shell und der erkannte Koeder (siehe oben): eine ruhende
+    // Seite traegt oft keine einzige Endlos-Animation, also beweist die Sonde
+    // an einem eingebauten Verstoss, dass sie ihn saehe.
     assert.deepEqual(unmeasured, [],
-      'Zustaende ohne laufenden Backdrop - dort hat die Sonde nichts gemessen, statt nichts '
-      + 'zu finden. Fehlt die Shell (Route nicht aufgebaut, auf /login gelandet), oder laufen '
-      + `die .lg-blob nicht mehr?\n  ${unmeasured.join('\n  ')}`);
+      'Zustaende ohne aufgebaute Shell oder ohne erkannten Koeder - dort hat die Sonde nichts gemessen, statt nichts '
+      + `zu finden (Route nicht aufgebaut, auf /login gelandet?).\n  ${unmeasured.join('\n  ')}`);
+    assert.deepEqual(backdropBack, [],
+      'Der Backdrop ist zurueck. Er lag vollstaendig unter dem opaken Scrollport und ist '
+      + `mit R18 gestrichen (DESIGN.md, "Colors").\n  ${backdropBack.join('\n  ')}`);
 
     assert.deepEqual(offenders.sort(), [],
       'Ein endlos animiertes Element traegt einen `filter` und rastert ihn damit pro '
       + 'Frame neu - im Leerlauf, solange die Seite offen ist (Issue #716). Bewegung '
       + 'und Filter gehoeren auf zwei Knoten: die aeussere Huelle bewegt sich, das '
-      + `Kind traegt den Filter und steht still (siehe .lg-blob in glass.css).\n  ${offenders.join('\n  ')}`);
+      + `Kind traegt den Filter und steht still.\n  ${offenders.join('\n  ')}`);
   });
 });
 
@@ -4706,7 +4823,9 @@ async function openExistingNoteEditor(page, noteId) {
   await page.click(`.note-card[data-id="${noteId}"] .note-card__open`);
   await page.waitForSelector('#note-content');
   await new Promise((resolve) => setTimeout(resolve, 300));
-  await page.click('.note-mode-switch [data-view="edit"]');
+  // Seit R18 (2026-10-07) fuehrt aus der Leseansicht EIN Weg in den Editor:
+  // der Primaerknopf im Fuss. Der Umschalter steht erst im Editor.
+  await page.click('#note-modal-edit');
   await page.waitForSelector('#note-pane-edit:not([hidden])');
 }
 
@@ -4883,7 +5002,7 @@ test('Sonde 21 - Notiz-Kategorien behalten Fokus, Gruppenrolle und Reader-Icons'
     await page.waitForSelector('.note-modal[data-view="read"]');
     const readTurns = [];
     for (let turn = 0; turn < 2; turn += 1) {
-      await page.click('.note-mode-switch [data-view="edit"]');
+      await page.click('#note-modal-edit');
       await page.click('.note-mode-switch [data-view="read"]');
       readTurns.push(await page.evaluate(() => ({
         icons: document.querySelectorAll('.note-read__categories svg').length,
@@ -4911,7 +5030,7 @@ test('Sonde 21 - Notiz-Kategorien behalten Fokus, Gruppenrolle und Reader-Icons'
 
     // Escape belongs to the open combobox first, then to the containing modal.
     // With a dirty search field the second press must reach the discard guard.
-    await page.click('.note-mode-switch [data-view="edit"]');
+    await page.click('#note-modal-edit');
     await new Promise((resolve) => setTimeout(resolve, 100));
     await page.focus('#note-category-search');
     await page.type('#note-category-search', third.name);

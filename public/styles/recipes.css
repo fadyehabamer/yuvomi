@@ -319,11 +319,8 @@
 .recipe-row__chevron {
   flex-shrink: 0;
   color: var(--color-text-tertiary);
-  /* EIN Tempo fuer jeden Aufklapp-Winkel: wie `.list-group__chevron`
-   * (list-row.css) dreht er im Takt des Panels, das darunter aufzieht
-   * (expandIn/collapseOut: --duration-lg, --ease-in-out). Vorher 150ms
-   * gegen 250ms - der Winkel war fertig, bevor das Panel halb offen war. */
-  transition: transform var(--duration-lg) var(--ease-in-out);
+  /* Ein Wegweiser (chevron-right): die Zeile oeffnet das Rezept als
+   * Leseblatt (R19). Bis dahin drehte sich hier ein Aufklapp-Winkel. */
 }
 
 /* Gespiegelte Zeile ganz ohne Detail (recipes.js, isMirrored && !hasDetail):
@@ -334,26 +331,11 @@
   visibility: hidden;
 }
 
-.recipe-row__toggle[aria-expanded="true"] .recipe-row__chevron {
-  transform: rotate(180deg);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .recipe-row__chevron {
-    transition: none;
-  }
-}
-
 /* --------------------------------------------------------
- * Aufklapp-Detail
+ * Rezept-Detail: EIN Inhalt fuer Leseblatt (unter der Schwelle) und
+ * Detailspalte (fillRecipeDetail, recipes.js). Bis R19 hing er als
+ * Aufklapper unter der Zeile.
  * -------------------------------------------------------- */
-
-/* Geschwister der Zeile, nicht ihr Kind: die Zeile bleibt beim Aufklappen in
- * ihrer Höhe und behält ihre Bedienzone an derselben Stelle.
- *
- * Sichtbarkeit über `hidden`, nicht über eine max-height-Transition: ein per
- * Transition versteckter Inhalt erscheint auf inaktiven Tabs und in
- * headless-Renderern nie. */
 .recipe-detail {
   display: grid;
   gap: var(--space-3);
@@ -410,14 +392,46 @@
   font-size: var(--type-body);
   color: var(--color-text-primary);
   font-variant-numeric: tabular-nums;
-  /* Zutat links, Vorrats-Zuordnung rechts, und bei 320px untereinander statt
-   * abgeschnitten: ein Vorratsname ist so lang, wie der Haushalt ihn getippt
-   * hat. */
-  display: flex;
-  flex-wrap: wrap;
+  /* DREI SPALTEN: Menge - Zutat - Vorrats-Zuordnung (Critique R18). Die Menge
+   * steht rechtsbuendig in ihrer eigenen Spalte, die Zuordnung am Zeilenende.
+   * Rueckfall ohne Subgrid: jede Zeile misst ihre Mengenspalte selbst, mit
+   * einer Mindestbreite, in die "200 g" und "1 EL" passen - gleich breit,
+   * solange keine Menge laenger ist. Die Zuordnung darf umbrechen: ein
+   * Vorratsname ist so lang, wie der Haushalt ihn getippt hat. */
+  display: grid;
+  grid-template-columns: minmax(var(--space-12), max-content) minmax(0, 1fr) fit-content(45%);
   align-items: baseline;
-  justify-content: space-between;
-  gap: var(--space-1) var(--space-2);
+  gap: var(--space-1) var(--space-3);
+}
+
+.recipe-detail__ingredient-quantity {
+  text-align: end;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+.recipe-detail__ingredient-name {
+  min-width: 0;
+  hyphens: auto;
+  hyphenate-limit-chars: 6 4 4;
+  -webkit-hyphenate-limit-before: 4;
+  -webkit-hyphenate-limit-after: 4;
+  overflow-wrap: break-word;
+}
+
+/* Mit Subgrid teilt sich die ganze Liste EINE Mengenspalte: sie ist so breit
+ * wie die laengste Menge des Rezepts, und jede Zeile endet an derselben Kante
+ * (Chrome 117, Firefox 71, Safari 16). */
+@supports (grid-template-columns: subgrid) {
+  .recipe-detail__ingredients {
+    grid-template-columns: max-content minmax(0, 1fr) fit-content(45%);
+    column-gap: var(--space-3);
+  }
+
+  .recipe-detail__ingredient {
+    grid-column: 1 / -1;
+    grid-template-columns: subgrid;
+  }
 }
 
 /* Die Einkaufskategorie einer Zutat. Sie steht sonst nur im Formular; bei
@@ -632,7 +646,6 @@ button.recipe-detail__ingredient-match:hover {
  * nach der gerechneten Darstellung der Spalte (syncRowMode).
  * -------------------------------------------------------- */
 
-.recipes-list--split .recipe-detail,
 .recipes-list--split .recipe-row__chevron {
   display: none;
 }
@@ -644,4 +657,11 @@ button.recipe-detail__ingredient-match:hover {
 .recipe-detail--pane {
   gap: var(--space-4);
   padding: var(--space-4) var(--space-5) var(--space-5);
+}
+
+/* Im Leseblatt traegt die Zeile der Leseansicht (`.detail-row`) das Polster
+ * des Blatts; das Detail selbst rueckt nicht noch einmal ein. */
+.recipe-detail--sheet {
+  gap: var(--space-4);
+  padding: 0;
 }

@@ -82,6 +82,65 @@ test('die Signatur bleibt: fuenf Positionsargumente plus optionaler Siegel-Slug'
   assert.ok(!/widget__link/.test(html), 'ohne Ziel weiterhin kein Link');
 });
 
+// R18: DER SLUG DES SIEGELS IST EIN MODUL, KEIN STUECK ADRESSE. Das Budget-Widget
+// verlinkt auf `/budget?tab=budget`; der Slug wurde am ersten `/` geschnitten und
+// ergab `var(--module-budget?tab=budget, ...)` - ungueltig, das Siegel stand im
+// geerbten Violett. Der Text-Guard „wer ein Markensiegel baut, benennt eine
+// Herkunft" (test-frontend-audit.js) sah die Zeichenkette `--seal-accent` und
+// war gruen. Deshalb hier der AUFRUF: jedes Ziel, das dashboard.js einem
+// Widget-Kopf gibt, laeuft durch widgetHeader, und der Ton muss ein Token sein,
+// das tokens.css kennt.
+test('jedes Widget-Siegel nennt einen Modulton, den tokens.css kennt (R18)', async () => {
+  const { readFileSync } = await import('node:fs');
+  const read = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8');
+  const known = new Set([...read('../public/styles/tokens.css').matchAll(/--module-([a-z-]+)\s*:/g)].map((m) => m[1]));
+  assert.ok(known.has('budget') && known.has('health'), 'Reichweite: die Modulliste wurde gelesen');
+
+  const src = read('../public/pages/dashboard.js');
+  const constants = Object.fromEntries(
+    [...src.matchAll(/^const ([A-Z_]+_ROUTE) = '([^']+)';/gm)].map((m) => [m[1], m[2]]));
+  const slugOf = (html) => html.match(/--seal-accent: var\(--module-([^,)]*)/)?.[1];
+
+  // Jeder Aufruf mit seinen Argumenten - ueber die Klammern, nicht ueber ein
+  // Muster: `t('nav.budget')` schliesst vor dem Ziel schon einmal.
+  const calls = [];
+  for (const m of src.matchAll(/(?<!function )widgetHeader\('([a-z-]+)'/g)) {
+    let depth = 0;
+    let end = m.index + 'widgetHeader'.length;
+    do {
+      if (src[end] === '(') depth += 1;
+      else if (src[end] === ')') depth -= 1;
+      end += 1;
+    } while (depth > 0);
+    calls.push([src.slice(m.index, end), m[1]]);
+  }
+  assert.ok(calls.length >= 30, `Reichweite: ${calls.length} Aufrufe gefunden`);
+
+  const offenders = [];
+  let viaConstant = 0;
+  for (const [text, id] of calls) {
+    const route = text.match(/'(\/[^']*)'/)?.[1];
+    const constant = text.match(/\b([A-Z_]+_ROUTE)\b/)?.[1];
+    const seal = text.match(/,\s*'([a-z-]+)'\)$/)?.[1] ?? null;
+    if (constant) viaConstant += 1;
+    const href = route ?? (constant ? constants[constant] : null);
+    if (constant) assert.ok(href, `${constant} ist aufloesbar`);
+    // Ohne Ziel und ohne benannte Herkunft bleibt nur, was der Aufruf selbst
+    // mitgibt (das Familie-Widget rechnet sein Ziel zur Laufzeit, nennt aber
+    // die Herkunft).
+    const slug = slugOf(widgetHeader(id, 'Titel', null, href, null, seal));
+    if (!slug) offenders.push(`${id}: kein Modulton (weder Ziel noch sealSlug) in ${text}`);
+    else if (!known.has(slug)) offenders.push(`${id}: --module-${slug} gibt es nicht (${text})`);
+  }
+  assert.ok(viaConstant >= 2, 'Reichweite: der Budget-Kopf (Route mit Query) ist dabei');
+  assert.deepEqual(offenders, []);
+
+  // Und die Regel selbst, an den Formen, die eine Adresse haben kann.
+  for (const href of ['/budget?tab=budget', '/budget#monat', '/budget/', '/budget/x?y=1']) {
+    assert.equal(slugOf(widgetHeader('budget', 'Budget', null, href)), 'budget', href);
+  }
+});
+
 test('das Raster hat eine eigene h2 - die Widgets haengen nicht unter „Heute wichtig"', () => {
   const html = renderDashboardLayout([{ id: 'clock', visible: true, size: '1x1' }], {}, null, 'EUR');
   const gridAt = html.indexOf('dashboard__grid');
@@ -187,10 +246,38 @@ test('die globale Suche ist von der Uebersicht mit einem Tipp erreichbar, und ni
   global.window ??= { yuvomi: null };
   const user = { display_name: 'Linda' };
   const normal = renderDashboardOverview(user, false, null, { followsDefault: true, canPublish: false });
-  assert.match(normal, /<button class="dashboard-icon-btn" id="dashboard-search"[^>]*aria-label="nav\.search"[^>]*aria-haspopup="dialog"/,
-    'ein benannter Icon-Knopf wie die zwei daneben');
+  // D1 (Critique 2026-10-16): dieselbe Kopf-Icon-Haut wie jeder Modulkopf.
+  assert.match(normal, /<button class="btn btn--secondary btn--icon dashboard-icon-btn" id="dashboard-search"[^>]*aria-label="nav\.search"[^>]*aria-haspopup="dialog"/,
+    'ein benannter Icon-Knopf in der Kopf-Icon-Haut (btn--secondary btn--icon) wie die zwei daneben');
+  for (const id of ['dashboard-wall-enter', 'dashboard-customize-btn']) {
+    assert.match(normal, new RegExp(`<button class="btn btn--secondary btn--icon dashboard-icon-btn" id="${id}"`), `${id}: Kopf-Icon-Haut`);
+  }
   const editing = renderDashboardOverview(user, true, null, { followsDefault: true, canPublish: false });
   assert.doesNotMatch(editing, /id="dashboard-search"/, 'im Anpassen-Modus zaehlt nur Abbrechen oder Speichern');
+});
+
+test('am Wandtablett bietet der Kopf weder Anpassen noch die Suche an (#1808)', () => {
+  // Beide Knoepfe enden an einer Route, die ein Display nicht erreicht:
+  // `PUT /preferences` und `GET /search` antworten ihm mit 403 (gemessen am
+  // echten Server in test:display-account). Der Melder ordnete sein Brett um
+  // und bekam beim Speichern den englischen Rohtext der Scope-Sperre.
+  global.window ??= { yuvomi: null };
+  const mensch = renderDashboardOverview({ display_name: 'Linda' }, false, null, {});
+  // BEIM MENSCHEN ZUERST: eine Zusicherung ueber eine Abwesenheit braucht den
+  // Gegenfall, sonst ist sie auch gruen, wenn der Kopf die Knoepfe gar nicht
+  // mehr zeichnet.
+  assert.match(mensch, /id="dashboard-customize-btn"/, 'der Mensch behaelt den Einstieg');
+  assert.match(mensch, /id="dashboard-search"/, 'und die Suche');
+
+  const tablett = renderDashboardOverview({ display_name: 'Kueche', access_scope: 'display' }, false, null, {});
+  assert.doesNotMatch(tablett, /id="dashboard-customize-btn"/, 'kein Einstieg in eine Anordnung, die sich nicht speichern laesst');
+  assert.doesNotMatch(tablett, /id="dashboard-search"/, 'keine Suche, die nur 403 antworten kann');
+  // Der Wandmodus bleibt: er ist ein Zustand der Seite und schreibt nichts.
+  assert.match(tablett, /id="dashboard-wall-enter"/, 'der Wandmodus gehoert gerade an dieses Geraet');
+  // Ein Ausgaben-Gast oder ein anderes enges Konto ist nicht mitgemeint:
+  // `/preferences` steht ihnen offen.
+  const gast = renderDashboardOverview({ display_name: 'Gast', access_scope: 'split_guest' }, false, null, {});
+  assert.match(gast, /id="dashboard-customize-btn"/, 'die Regel haengt am Display, nicht an jedem engen Konto');
 });
 
 test('Abbrechen fragt nur, wenn es etwas zu verlieren gibt (H2)', () => {
@@ -610,6 +697,21 @@ test('R14 P2: mobil stehen mehrere Ueberfaellige als EINE Sammelzeile, die an Or
   assert.match(html, /Elternabend/, 'der Rest des Tages bleibt');
 }));
 
+test('#1828 Sammelzeile: eine ueberfaellige Aufgabe fuer zwei nennt BEIDE, nicht nur die erste Person', () => withStage(true, () => {
+  const linda = { id: 3, display_name: 'Linda Johnson', avatar_color: '#6a5acd' };
+  const emma = { id: 4, display_name: 'Emma Johnson', avatar_color: '#c2185b' };
+  const html = renderTodayCockpit({
+    urgentTasks: [
+      { id: 1, title: 'Rueckstand 1', due_date: overdueDay(), status: 'open', assigned_users: [linda, emma] },
+      { id: 2, title: 'Rueckstand 2', due_date: overdueDay(), status: 'open', assigned_users: [linda] },
+    ],
+  }, [], false, { overdueOpen: false });
+  const group = html.match(/<button\b[^>]*data-today-overdue[^>]*>[\s\S]*?<\/button>/)?.[0];
+  assert.ok(group, `eine Sammelzeile steht im Blatt: ${html.slice(0, 300)}`);
+  assert.match(accessibleText(group), /Linda Johnson, Emma Johnson/, 'Emma ist nur ueber die gemeinsame Aufgabe dran und steht trotzdem da');
+  assert.equal((accessibleText(group).match(/Linda Johnson/g) ?? []).length, 1, 'jede Person einmal');
+}));
+
 test('R14 P2: am Desktop bleiben die Zeilen einzeln, und eine einzelne Ueberfaellige wird nie gesammelt', async () => {
   await withStage(false, () => {
     const html = renderTodayCockpit({ urgentTasks: fiveOverdue() }, []);
@@ -727,3 +829,34 @@ test('R14: auf dem Telefon bleibt der Speed-Dial in der Kapsel', () => withStage
   assert.match(__test.renderFab(), /class="page-fab-group"/);
   assert.doesNotMatch(renderDashboardOverview({ display_name: 'Linda' }, false, null, {}), /id="fab-main"/);
 }));
+
+// Critique 2026-10-16: jede Kachel fuehrt mit „Alle" zu ihrer Seite, nur die
+// Familie sagte „Verwalten" fuer denselben Weg. Und die Onboarding-Karte trug
+// Haarlinie plus 28px-Schatten (Detektor gpt-thin-border-wide-shadow): sie
+// nimmt jetzt das Material der schwebenden Tafel (glass.css).
+test('Dashboard: ein Wort fuer den Kopf-Link, Onboarding-Karte als schwebende Tafel (Critique 2026-10-16)', async () => {
+  const { eachRule } = await import('./css-rules.js');
+  const { readFileSync } = await import('node:fs');
+  assert.match(dashboardSource, /widgetHeader\('family', t\('dashboard\.familyTitle'\), null, manageHref, null, 'contacts'\)/,
+    'die Familie nimmt das gemeinsame Link-Wort');
+  assert.doesNotMatch(dashboardSource, /t\('dashboard\.manage'\)/);
+  const css = readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8');
+  const card = [...eachRule(css)].find((r) => !r.at.length && r.selector.trim() === '.onboarding-card');
+  assert.match(card?.body ?? '', /border:\s*none/, 'keine Haarlinie');
+  assert.match(card?.body ?? '', /box-shadow:\s*var\(--glass-shadow-lg\), var\(--glass-inset-elevated\)/, 'Tiefe und Lichtkante der schwebenden Tafel');
+});
+
+// R20 (Re-Critique 2026-10-17, A1 P3): Esc beendete das Anpassen nicht - am
+// Telefon war "Abbrechen" der einzige Weg. Esc nimmt denselben Weg wie der
+// Knopf (mit Rueckfrage bei Aenderungen) und laesst offene Dialoge und Menues
+// ihr eigenes Esc behalten.
+test('R20: Esc beendet das Anpassen wie "Abbrechen", nicht an einem offenen Dialog vorbei', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
+  const at = src.indexOf("if (event.key !== 'Escape' || event.defaultPrevented || !isCustomizing) return;");
+  assert.ok(at > 0, 'kein Esc-Ausstieg aus dem Anpassen');
+  const block = src.slice(src.lastIndexOf('if (isCustomizing) {', at), src.indexOf('}, { signal: signal });', at));
+  assert.match(block, /document\.addEventListener\('keydown'/);
+  assert.match(block, /dialog\[open\]/, 'ein offener Dialog behaelt sein Esc');
+  assert.match(block, /requestCancelDashboardConfig\(\)/, 'derselbe Weg wie der Knopf, mit Rueckfrage');
+});

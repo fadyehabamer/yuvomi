@@ -2,6 +2,7 @@ import { t } from '/i18n.js';
 import { moduleIconHTML } from '/nav-icons.js';
 import { esc } from '/utils/html.js';
 import { getReadableTextColor } from '/utils/color.js';
+import { formRowHtml } from '/utils/form-row.js';
 
 let settingRowIdCounter = 0;
 
@@ -196,6 +197,7 @@ export function createToggleRow(options) {
  * @param {object} options
  * @param {string} options.label
  * @param {string|null} [options.labelFor]  id des Bedienelements - dann ist das Label ein `<label for>`
+ * @param {string} [options.labelExtra]  rohes HTML hinter dem Label, etwa `REQUIRED_MARK`
  * @param {string|null} [options.labelId]   id am Label, fuer `aria-labelledby` einer Gruppe
  * @param {string} [options.description]    Sekundaerzeile: ein Hinweis, der nur DIESE Zeile betrifft
  * @param {string|null} [options.descriptionId]
@@ -207,26 +209,28 @@ export function settingRowHtml({
   label,
   labelFor = null,
   labelId = null,
+  labelExtra = '',
   description = '',
   descriptionId = null,
   control = '',
   extra = '',
   stacked = false,
+  field = false,
   className = '',
   attrs = {},
 }) {
-  const rowClass = ['settings-setting-row', stacked ? 'settings-setting-row--stacked' : '', className]
-    .filter(Boolean).join(' ');
-  const labelHtml = labelFor
-    ? `<label class="settings-setting-row__label"${attrsHtml({ id: labelId, for: labelFor })}>${esc(String(label ?? ''))}</label>`
-    : `<span class="settings-setting-row__label"${attrsHtml({ id: labelId })}>${esc(String(label ?? ''))}</span>`;
-  const descriptionHtml = description
-    ? `<p class="settings-setting-row__description"${attrsHtml({ id: descriptionId })}>${esc(String(description))}</p>`
-    : '';
-  return `<div class="${rowClass}"${attrsHtml(attrs)}>`
-    + `<div class="settings-setting-row__copy">${labelHtml}${descriptionHtml}${extra}</div>`
-    + `<div class="settings-setting-row__control">${control}</div>`
-    + '</div>';
+  // `field`: die Zeile ist der Traeger eines Feldfehlers (reportFieldError,
+  // components/modal.js) - die Meldung steht dann unter der Zeile, ueber beide
+  // Spalten, statt das Feld zu quetschen (layout.css, `.form-row`).
+  // DIE EINSTELLUNGSZEILE IST EINE FORMULARZEILE (R18, 2026-10-07): derselbe
+  // Baustein wie in den Erfassungsdialogen (utils/form-row.js). Die Klassen
+  // `settings-setting-row*` bleiben vorn - unter ihnen fuehrt settings.css die
+  // Masse des Blatts -, `form-row*` kommt dazu und bringt, was in der Zeile
+  // steht: die randlose Auswahl, das Datum als Wert, das zusammengesetzte Feld.
+  return formRowHtml({
+    label, labelFor, labelId, labelExtra, description, descriptionId, control, extra, stacked, field, className, attrs,
+    variant: 'settings-setting-row',
+  });
 }
 
 /**
@@ -251,6 +255,22 @@ export function settingSwitchRowHtml({ description = '', descriptionId = null, e
     + '</div>';
 }
 
+/**
+ * Die Schalterzeile eines DIALOGS (R19, Einstellungen B7): `toggleRowHtml` als
+ * Zeile des Dialog-Traegers `.form-rows` (utils/form-row.js), der Hinweis
+ * darunter und per `aria-describedby` verknuepft. Das Gegenstueck zu
+ * `settingSwitchRowHtml` fuer die Blaetter - dort traegt die Gruppe
+ * (`.settings-group`) ihre eigenen Masse, im Dialog der Formular-Traeger.
+ */
+export function formSwitchRowHtml({ hint = '', hintId = null, ...toggle }) {
+  const attrs = { ...(toggle.attrs ?? {}) };
+  if (hint && hintId && !attrs['aria-describedby']) attrs['aria-describedby'] = hintId;
+  return '<div class="form-switch">'
+    + toggleRowHtml({ ...toggle, control: 'switch', attrs })
+    + (hint ? `<p class="form-hint form-switch__hint"${attrsHtml({ id: hintId })}>${esc(String(hint))}</p>` : '')
+    + '</div>';
+}
+
 export function createSettingRow({ label, description, control }) {
   const rowId = `settings-setting-row-${++settingRowIdCounter}`;
   const formControl = control?.matches?.('input, select, textarea, button')
@@ -261,14 +281,15 @@ export function createSettingRow({ label, description, control }) {
     formControl.id = `${rowId}-control`;
   }
 
+  // Dieselben Klassenpaare wie `settingRowHtml()` (utils/form-row.js).
   const row = document.createElement('div');
-  row.className = 'settings-setting-row';
+  row.className = 'settings-setting-row form-row';
 
   const copy = document.createElement('div');
-  copy.className = 'settings-setting-row__copy';
+  copy.className = 'settings-setting-row__copy form-row__copy';
 
   const title = document.createElement(formControl ? 'label' : 'div');
-  title.className = 'settings-setting-row__label';
+  title.className = 'settings-setting-row__label form-row__label';
   title.textContent = String(label ?? '');
   if (formControl) title.htmlFor = formControl.id;
   copy.appendChild(title);
@@ -276,7 +297,7 @@ export function createSettingRow({ label, description, control }) {
   if (description) {
     const detail = document.createElement('p');
     detail.id = `${rowId}-description`;
-    detail.className = 'settings-setting-row__description';
+    detail.className = 'settings-setting-row__description form-row__description';
     detail.textContent = String(description);
     copy.appendChild(detail);
 
@@ -290,7 +311,7 @@ export function createSettingRow({ label, description, control }) {
   }
 
   const controlContainer = document.createElement('div');
-  controlContainer.className = 'settings-setting-row__control';
+  controlContainer.className = 'settings-setting-row__control form-row__control';
   appendContent(controlContainer, control);
 
   row.append(copy, controlContainer);

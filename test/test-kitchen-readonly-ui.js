@@ -236,7 +236,12 @@ test('Essensplan bei `read`: die Karte oeffnet die Leseansicht und traegt keine 
   }
 
   const voll = await withAccess(SCHREIBEN, () => kachel());
-  for (const erwartet of ['edit-meal', 'delete-meal', 'transfer-meal', 'add-meal']) {
+  // `delete-meal` stand hier bis R18 (2026-10-07): die Karte traegt keinen
+  // Papierkorb mehr, Loeschen lebt im Dialog (deleteMeal, unten geprueft).
+  assert.doesNotMatch(voll, /delete-meal/, 'die Karte traegt auch mit Schreibrecht keinen Papierkorb');
+  // `add-meal` steht seit D5 (Critique 2026-10-16) nur noch in LEEREN Zellen -
+  // dort prueft ihn „ein leerer Platz ist nur Zustand" unten im Gegenfall.
+  for (const erwartet of ['edit-meal', 'transfer-meal']) {
     assert.match(voll, new RegExp(`data-action="${erwartet}"`), `Gegenfall: ${erwartet} steht mit Schreibrecht da`);
   }
   assert.match(voll, /meal-card__drag/, 'Gegenfall: der Ziehgriff');
@@ -424,12 +429,16 @@ test('Essensplan bei `read`: Loeschen blendet nichts aus und oeffnet kein Rueckg
   }));
   const wege = {
     'deleteMeal direkt': () => meals.deleteMeal(11),
-    'stehen gebliebener Papierkorb': () => meals.onGridClick(klick('delete-meal', { mealId: '11' })),
   };
   for (const [name, weg] of Object.entries(wege)) {
     assert.deepEqual(await loeschen(LESEN, weg), { fenster: 0, ausgeblendet: false }, name);
     assert.deepEqual(await loeschen(SCHREIBEN, weg), { fenster: 1, ausgeblendet: true }, `Gegenfall ${name}`);
   }
+  // Ein stehen gebliebener Papierkorb der Karte loest seit R18 (2026-10-07)
+  // GAR NICHTS mehr aus - das Board kennt die Aktion nicht mehr, mit keinem Recht.
+  const stale = () => meals.onGridClick(klick('delete-meal', { mealId: '11' }));
+  assert.deepEqual(await loeschen(LESEN, stale), { fenster: 0, ausgeblendet: false });
+  assert.deepEqual(await loeschen(SCHREIBEN, stale), { fenster: 0, ausgeblendet: false }, 'delete-meal ist keine Board-Aktion mehr');
 });
 
 test('Essensplan: der offene Editor speichert nichts mehr, wenn das Recht inzwischen fehlt', async () => {
@@ -484,8 +493,11 @@ test('Essensplan: die Zieh-Verdrahtung folgt einem Rechtewechsel in beide Richtu
       };
       const zeigerRunter = (k) => {
         let verhindert = 0;
+        // Gefangen wird am gedrueckten Element, nicht an der Karte (Mausklick,
+        // Critique 2026-10-16) - der Zaehler sitzt deshalb am Ziel und zaehlt fuer die Karte.
         grid.handler.pointerdown[0]({ pointerType: 'mouse', pointerId: 1, clientX: 5, clientY: 5,
-          target: { closest: (sel) => (sel === '.meal-card' ? k : null) }, preventDefault() { verhindert += 1; } });
+          target: { closest: (sel) => (sel === '.meal-card' ? k : null), setPointerCapture() { k.gefangen += 1; } },
+          preventDefault() { verhindert += 1; } });
         return { gefangen: k.gefangen, verhindert };
       };
       rechte(LESEN);
@@ -566,9 +578,10 @@ const listeZeichnen = (modules, liste = [rezept(), kahl()]) => withAccess(module
   return { aktionen: aktionenImBaum(knoten), html: knoten.outerHTML };
 }));
 
-test('Rezepte bei `read`: die Zeile klappt auf und traegt keine Handlung', async () => {
+test('Rezepte bei `read`: die Zeile oeffnet das Rezept und traegt keine Handlung', async () => {
   const lesend = await listeZeichnen(LESEN);
-  assert.deepEqual([...new Set(lesend.aktionen)], ['toggle-detail'],
+  // R19: die Zeile oeffnet ein Leseblatt (`open-detail`) statt aufzuklappen.
+  assert.deepEqual([...new Set(lesend.aktionen)], ['open-detail'],
     'jede Zeile fuehrt ins Detail - auch die ohne Zutaten, Notiz und Link, die sonst das Formular oeffnete');
   assert.equal(lesend.aktionen.length, 2);
   assert.doesNotMatch(lesend.html, /list-row__actions|recipe-row__more|popover-menu/, 'keine Bedienzone, kein Ueberlaufmenue');
@@ -579,7 +592,9 @@ test('Rezepte bei `read`: die Zeile klappt auf und traegt keine Handlung', async
   }
 
   const voll = await listeZeichnen(SCHREIBEN);
-  for (const erwartet of ['edit', 'duplicate', 'delete', 'add-to-meals', 'to-shopping', 'match-ingredient', 'match-ingredients']) {
+  // Die Kreislauf-Ausgaenge (Einplanen, Einkauf, Vorrat) stehen seit R19 nur
+  // noch im Detail (Leseblatt/Spalte), nicht als Aufklapper in der Liste.
+  for (const erwartet of ['edit', 'duplicate', 'delete', 'open-detail']) {
     assert.ok(voll.aktionen.includes(erwartet), `Gegenfall: ${erwartet} steht mit Schreibrecht da`);
   }
   assert.match(voll.html, /list-row__actions/);
@@ -596,7 +611,8 @@ test('Rezepte bei `read`: das Detail zeigt, was sonst nur im Formular stand', as
   assert.match(lesend.html, /recipe-card__meal-types/, 'die Mahlzeiten stehen da, auch wenn alle gelten');
   assert.equal((lesend.html.match(/meal-type-badge--/g) ?? []).length, 4);
   assert.match(lesend.html, /recipe-detail__ingredient-category">Backwaren</, 'die Einkaufskategorie je Zutat');
-  assert.match(lesend.html, /250 g · Mehl/);
+  // Seit R18 steht die Menge in ihrer eigenen Spalte vor dem Namen (eigener Test unten).
+  assert.match(lesend.html, /<span class="recipe-detail__ingredient-quantity">250 g<\/span><span class="recipe-detail__ingredient-name">Mehl/);
   assert.match(lesend.html, /Teig ruhen lassen/);
   // Der Mini-DOM schreibt `href` nicht ins Markup; der Link ist am Text zu erkennen.
   assert.match(lesend.html, /<a class="btn btn--ghost">.*recipes\.openLink/, 'der Link ist Lesen und bleibt');
@@ -636,7 +652,7 @@ test('Rezepte: „Auf die Einkaufsliste" folgt dem Einkaufsrecht, nicht dem Kuec
   assert.deepEqual(await klicken(LESEN), [], 'ohne Einkaufsrecht geht auch er nicht raus');
 });
 
-test('Rezepte bei `read`: die Detailspalte traegt nur den Titel', async () => {
+test('Rezepte bei `read`: die Detailspalte traegt nur den Titel, keinen Fuss', async () => {
   const kopf = (modules) => withAccess(modules, () => mitRezepten([rezept()], () => {
     const body = new MiniElement('div');
     recipes.renderRecipePane(21, body);
@@ -644,11 +660,13 @@ test('Rezepte bei `read`: die Detailspalte traegt nur den Titel', async () => {
   }));
   const lesend = await kopf(LESEN);
   assert.match(lesend, /split-view__detail-title">Pfannkuchen</);
-  assert.doesNotMatch(lesend, /split-view__detail-actions|<button/);
+  assert.doesNotMatch(lesend, /split-view__detail-footer|recipes-detail-edit/);
   const voll = await kopf(SCHREIBEN);
-  assert.match(voll, /split-view__detail-actions/, 'Gegenfall');
-  assert.match(voll, /common\.edit/);
-  assert.equal((voll.split('</header>')[0].match(/<button /g) ?? []).length, 3, 'Bearbeiten, Duplizieren, Loeschen');
+  // R19: Bearbeiten, Duplizieren, Loeschen stehen im Fuss, Bearbeiten primaer am Ende.
+  assert.match(voll, /split-view__detail-footer/, 'Gegenfall');
+  assert.match(voll, /id="recipes-detail-edit"[^>]*>common\.edit|common\.edit/);
+  const fuss = voll.slice(voll.indexOf('split-view__detail-footer'));
+  assert.equal((fuss.match(/<button /g) ?? []).length, 3, 'Loeschen, Duplizieren, Bearbeiten');
 });
 
 test('Rezepte bei `read`: kein FAB, und der Leerzustand laedt zu nichts ein', async () => {
@@ -803,4 +821,36 @@ test('Rezepte: die Vorrats-Zuordnung braucht Kueche UND Vorrat, wie der Server',
     '`meals: read` + `pantry: write`: der Zustand bleibt, der Knopf endete im 403');
   assert.deepEqual(await zeichen({ meals: 'write', shopping: 'write', pantry: 'read' }), { tag: 'span', aktion: null, sammel: false });
   assert.deepEqual(await zeichen(LESEN), { tag: 'span', aktion: null, sammel: false });
+});
+
+/* ZUTATENMENGEN ALS EIGENE SPALTE (Critique R18, 2026-10-07): "200 g · Mehl"
+ * stand in einem Text, jede Zeile begann woanders. */
+test('R18: die Menge einer Zutat steht in ihrer eigenen rechtsbuendigen Spalte', async () => {
+  const el = new MiniElement('div');
+  const r = { id: 31, title: 'Brot', source: 'native', has_own_image: false, meal_types: ['dinner'], ingredients: [{ name: 'Mehl', quantity: '200 g' }, { name: 'Salz' }] };
+  await withAccess(SCHREIBEN, () => mitRezepten([r], () => { recipes.fillRecipeDetail(el, r); }));
+  const find = (node, cls, out = []) => {
+    if (node?.className === cls) out.push(node);
+    for (const child of node?.childNodes ?? []) find(child, cls, out);
+    return out;
+  };
+  const rows = find(el, 'recipe-detail__ingredient');
+  assert.equal(rows.length, 2);
+  const [menge, name] = rows[0].childNodes;
+  assert.equal(menge.className, 'recipe-detail__ingredient-quantity');
+  assert.equal(menge.textContent, '200 g');
+  assert.equal(name.className, 'recipe-detail__ingredient-name');
+  assert.equal(name.textContent, 'Mehl', 'der Name steht allein - nicht mehr "200 g · Mehl"');
+  assert.equal(rows[1].childNodes[0].className, 'recipe-detail__ingredient-quantity', 'ohne Menge bleibt die Zelle stehen, damit der Name seine Spalte haelt');
+  assert.equal(rows[1].childNodes[0].textContent, '');
+  const { eachRule } = await import('./css-rules.js');
+  const css = (await import('node:fs')).readFileSync(new URL('../public/styles/recipes.css', import.meta.url), 'utf8');
+  const rules = [...eachRule(css)];
+  const body = (sel, at = (r) => r.at.length === 0) => rules.filter((r) => r.selector.trim() === sel && at(r)).map((r) => r.body).join(';');
+  assert.match(body('.recipe-detail__ingredient-quantity'), /text-align:\s*end/, 'rechtsbuendig');
+  assert.match(body('.recipe-detail__ingredient'), /font-variant-numeric:\s*tabular-nums/, 'tabellarisch');
+  assert.match(body('.recipe-detail__ingredient'), /grid-template-columns:\s*minmax\(var\(--space-12\), max-content\) minmax\(0, 1fr\) fit-content\(45%\)/);
+  const sub = (r) => r.at.some((a) => /@supports\s*\(grid-template-columns:\s*subgrid\)/.test(a));
+  assert.match(body('.recipe-detail__ingredient', sub), /grid-template-columns:\s*subgrid/, 'mit Subgrid teilt die Liste EINE Mengenspalte');
+  assert.match(body('.recipe-detail__ingredients', sub), /grid-template-columns:\s*max-content minmax\(0, 1fr\) fit-content\(45%\)/);
 });

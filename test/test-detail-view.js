@@ -18,6 +18,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), 'utf8');
 
@@ -202,8 +203,9 @@ test('im Sheet steht Bearbeiten als Hauptaktion unten, Löschen zurückgenommen 
   const sheet = src.slice(src.indexOf('function openAsSheet'), src.indexOf('// Präsentation: Popover'));
   // Der Knopf entsteht in der FUSSZEILE, als Primaerknopf, NACH den Aktionen
   // des Aufrufers - also am Ende, in der Daumenzone.
-  assert.match(sheet, /\[\.\.\.\(opts\.actions \?\? \[\]\), \{\s*id: 'detail-view-edit',[\s\S]{0,120}variant: 'primary'/,
-    'mit edit.primary gehört Bearbeiten als Primärknopf ans Ende der Fußzeile');
+  assert.match(sheet, /detailFooterEl\(withPrimaryEdit\(opts\.actions, primaryEdit \? \{\s*id: 'detail-view-edit',/,
+    'Bearbeiten gehört als Primärknopf ans Ende der Fußzeile');
+  assert.match(sheet, /primaryEdit: Boolean\(opts\.edit\)/, 'R19: in jedem Blatt mit Bearbeiten, nicht mehr als Option');
   // Oben bleibt kein zweites Bearbeiten stehen; der Kopfknopf erscheint erst im
   // Formular, als „Zurück".
   assert.match(sheet, /hidden: primaryEdit/, 'der Kopfknopf muss in der Leseansicht verborgen sein');
@@ -212,28 +214,21 @@ test('im Sheet steht Bearbeiten als Hauptaktion unten, Löschen zurückgenommen 
   // Löschen steht am ANFANG - logisch, damit RTL es nicht an das Ende schiebt.
   const css = await detailCss();
   assert.match(css, /\.detail-view__action--start \{\s*margin-inline-end: auto;/, 'Löschen muss am Anfang stehen, auch in RTL');
-  // Der Kalender nimmt die Option; sein Löschen bleibt zurückgenommen.
+  // Der Kalender: sein Löschen bleibt zurückgenommen.
   const cal = await calendarJs();
   const detail = cal.slice(cal.indexOf('async function openEventDetail('), cal.indexOf('async function loadReminderForEvent('));
-  assert.match(detail, /primary: true,/, 'der Termin-Sheet setzt Bearbeiten nicht als Hauptaktion');
   assert.match(detail, /id: 'detail-delete',[\s\S]{0,80}variant: 'danger-ghost',[\s\S]{0,40}align: 'start'/,
     'Löschen bleibt destruktiv gestylt und am Anfang, nicht an der Primärposition');
 });
 
 test('im Popover gilt dieselbe Ordnung wie im Sheet: Löschen am Anfang, Bearbeiten primär am Ende (Re-Kritik 2026-09-25)', async () => {
   const src = await detailJs();
-  const popover = src.slice(src.indexOf('function openAsPopover'), src.indexOf('const footer = detailFooterEl(actions)'));
-  // Mit edit.primary kommt Bearbeiten NACH den Aktionen des Aufrufers - sonst
-  // steht Löschen direkt daneben und sein `--start` wirkt nicht, weil es nicht
-  // mehr das erste Element ist.
-  assert.match(popover, /opts\.edit\?\.primary\s*\?\s*\[\.\.\.\(opts\.actions \?\? \[\]\), edit\]/,
-    'mit edit.primary gehört Bearbeiten ans Ende der Popover-Fußzeile');
-  assert.match(popover, /opts\.edit\.primary \? \{ variant: 'primary'/,
-    'mit edit.primary ist Bearbeiten auch im Popover der Primärknopf');
-  // Ohne die Option bleibt alles wie bisher (Kontakte, Inventar, Budget ...).
-  assert.match(popover, /:\s*\[edit, \.\.\.\(opts\.actions \?\? \[\]\)\]/,
-    'ohne edit.primary steht Bearbeiten weiter vorne');
-  assert.match(popover, /: \{ variant: 'secondary' \}/, 'ohne edit.primary bleibt Bearbeiten sekundär');
+  const popover = src.slice(src.indexOf('function openAsPopover'), src.indexOf("footer.classList.add('detail-popover__footer')"));
+  // Bearbeiten kommt NACH den Aktionen des Aufrufers - sonst steht Löschen
+  // direkt daneben und sein `--start` wirkt nicht. Seit R19 immer, nicht mehr
+  // nur mit `edit.primary`.
+  assert.match(popover, /detailFooterEl\(withPrimaryEdit\(opts\.actions, edit, \{ keepPrimary: opts\.keepPrimary \}\)\)/,
+    'Bearbeiten gehört als Primärknopf ans Ende der Popover-Fußzeile');
 });
 
 test('beide Fußzeilen werden aufbewahrt statt verworfen', async () => {
@@ -369,10 +364,22 @@ test('die Termin-Verdrahtung ist zweigeteilt', async () => {
 test('die Termin-Detailansicht zeigt, was das alte Popup verschwieg', async () => {
   const src = await calendarJs();
   const fn = src.slice(src.indexOf('function renderEventDetail'), src.indexOf('async function openEventDetail'));
-  assert.match(fn, /recurrenceRow\(ev\.recurrence_rule\)/, 'Wiederholung im Klartext');
+  assert.match(fn, /recurrenceRow\(ev\.recurrence_rule[,)]/, 'Wiederholung im Klartext');
   assert.match(fn, /reminderSummary\(/, 'Erinnerungen im Klartext');
   assert.match(fn, /visibilityRow\(ev\.visibility\)/, 'Sichtbarkeit');
-  assert.match(fn, /assignedRow\(ev\.assigned_users/, 'Zugewiesene über die geteilte Zeile');
+  // Seit R18 stehen WANN und WER im Kopf (eventDetailHead); die geteilte Zeile
+  // bleibt fuer den frei eingetragenen Namen ohne Konto.
+  assert.match(fn, /ev\.assigned_users\?\.length \? null : assignedRow\(\[\], t\('calendar\.assignedLabel'\), ev\.assigned_name \|\| ''\)/,
+    'ein freier Name ohne Konto bleibt eine Zeile');
+  assert.doesNotMatch(fn, /calendar\.detailWhen/, 'die Wann-Zeile ist in den Kopf gewandert');
+  const head = src.slice(src.indexOf('function eventDetailHead'), src.indexOf('function eventMapUrl'));
+  assert.match(head, /dot: resolveEventBackground\(ev\)/, 'Farbpunkt statt Farbstreifen');
+  assert.match(head, /subtitle: eventWhenRelative\(ev\)/, 'die Zeit in Worten');
+  assert.match(head, /subtitleLabel: t\('calendar\.detailWhen'\)/, 'Screenreader hoeren weiter "Wann"');
+  assert.match(head, /people: ev\.assigned_users \?\? \[\]/, 'Personen als Avatare');
+  const open = src.slice(src.indexOf('async function openEventDetail'));
+  assert.match(open, /head: eventDetailHead\(ev\),/);
+  assert.doesNotMatch(open.slice(0, open.indexOf('sections: renderEventDetail')), /accentColor:/, 'kein frei stehender Farbstreifen mehr');
 });
 
 test('der Ort öffnet sich als ausdrückliche Aktion in einer Karte, nicht als Link auf dem Text (#1110)', async () => {
@@ -647,7 +654,8 @@ test('der Status lässt sich aus der Detailansicht weiterschalten', async () => 
 test('die Aufgaben-Detailansicht führt die Leseinformationen der Karte', async () => {
   const src = await taskDetailJs();
   const fn = src.slice(src.indexOf('function renderTaskDetail'), src.indexOf('export function openTaskDetail'));
-  for (const key of ['tasks.statusLabel', 'tasks.priorityLabel', 'tasks.dueDateLabel', 'tasks.startDateLabel',
+  // Seit R18 stehen Faelligkeit und Personen im Kopf (taskDetailHead).
+  for (const key of ['tasks.statusLabel', 'tasks.priorityLabel', 'tasks.startDateLabel',
     'tasks.categoryLabel', 'tasks.pointsLabel', 'tasks.tagsLabel',
     'tasks.subtasksLabel', 'tasks.documentsLabel', 'tasks.descriptionLabel']) {
     assert.match(fn, new RegExp(reLiteral(key)), `${key} fehlt in der Detailansicht`);
@@ -656,7 +664,109 @@ test('die Aufgaben-Detailansicht führt die Leseinformationen der Karte', async 
   // bleibt aber die geteilte - deshalb offen bis zur Klammer statt exakt.
   assert.match(fn, /recurrenceRow\(task\.recurrence_rule[),]/, 'Wiederholung über die geteilte Zeile');
   assert.match(fn, /visibilityRow\(task\.visibility\)/, 'Sichtbarkeit über die geteilte Zeile');
-  assert.match(fn, /assignedRow\(task\.assigned_users/, 'Zugewiesene über die geteilte Zeile');
+  const head = src.slice(src.indexOf('function taskDetailHead'), src.indexOf('function renderTaskDetail'));
+  assert.match(head, /subtitle: due\?\.label \?\? ''/, 'die Faelligkeit in den Worten der Liste');
+  assert.match(head, /subtitleLabel: t\('tasks\.dueDateLabel'\)/);
+  assert.match(head, /people: task\.assigned_users \?\? \[\]/, 'Zugewiesene als Avatare im Kopf');
+  assert.match(src, /head: taskDetailHead\(task\),/);
+  // Erledigen ist die Hauptaktion: der EINE Primaerknopf im Fuss - fuer eine
+  // erledigte Aufgabe seit R19 (Ulas 2026-10-16) entsprechend Wieder oeffnen.
+  const steps = src.slice(src.indexOf('const STATUS_ACTIONS = {'), src.indexOf('/** Prioritätsbadge'));
+  assert.equal(steps.match(/id: 'task-detail-finish'[^}]*variant: 'primary'/g)?.length, 2, 'offen und in Arbeit');
+  assert.equal(steps.match(/id: 'task-detail-reopen'[^}]*variant: 'primary'/g)?.length, 1, 'erledigt: Wieder oeffnen');
+  assert.equal(steps.match(/variant: 'primary'/g)?.length, 3, 'sonst ist nichts primaer');
+});
+
+/* DETAILANSICHTEN MIT KOPF (Critique R18, 2026-10-07). Termin, Aufgabe und
+ * Geburtstag oeffneten als Schluessel-Wert-Zeilen, Personen als Kommatext,
+ * darueber eine frei stehende 2px-Farblinie. Gemessen wird der laufende
+ * Renderer in einem kleinen Schein-DOM, nicht sein Quelltext. */
+test('R18: der Kopf der Leseansicht - Unterzeile mit Farbpunkt, Kennzahlen, Personen als Avatare', async () => {
+  const { register } = await import('node:module');
+  register('./test-browser-loader.mjs', import.meta.url);
+  class El {
+    constructor(tag) {
+      this.tagName = tag.toUpperCase(); this.children = []; this.attrs = {}; this.className = ''; this.textContent = '';
+      this.styles = {}; this.style = { setProperty: (k, v) => { this.styles[k] = v; } };
+      this.classList = { add: (c) => { this.className = `${this.className} ${c}`.trim(); } };
+      this.dataset = {};
+    }
+    setAttribute(k, v) { this.attrs[k] = String(v); }
+    appendChild(c) { this.children.push(c); return c; }
+    append(...cs) { cs.forEach((c) => this.children.push(c)); }
+    find(cls) {
+      if (String(this.className).split(/\s+/).includes(cls)) return this;
+      for (const c of this.children) { const hit = c.find?.(cls); if (hit) return hit; }
+      return null;
+    }
+    all(cls, out = []) {
+      if (String(this.className).split(/\s+/).includes(cls)) out.push(this);
+      for (const c of this.children) c.all?.(cls, out);
+      return out;
+    }
+    get text() { return this.textContent + this.children.map((c) => c.text ?? '').join(''); }
+  }
+  const saved = {};
+  for (const k of ['document', 'HTMLElement']) saved[k] = Object.getOwnPropertyDescriptor(globalThis, k);
+  Object.assign(globalThis, { document: { createElement: (tag) => new El(tag) }, HTMLElement: El });
+  try {
+    const { detailHeadEl } = await import('../public/components/detail-view.js');
+    assert.equal(detailHeadEl(undefined), null);
+    assert.equal(detailHeadEl({ dot: '#00668F', subtitle: '  ', people: [], facts: [''] }), null, 'ohne einen Teil entsteht kein Kopf - auch kein Punkt allein');
+
+    // Termin: Farbpunkt, Zeit in Worten (Screenreadern beim Namen genannt), Personen.
+    const termin = detailHeadEl({
+      dot: '#00668F', subtitle: 'Heute, 20:00 - 22:00', subtitleLabel: 'Wann',
+      people: [{ display_name: 'Emma <b>Johnson</b>', color: '#CE2A63' }, { display_name: 'Leo', avatar_data: 'data:image/png;base64,AA' }, { color: '#000000' }],
+      peopleLabel: 'Zugewiesen',
+    });
+    assert.equal(termin.className, 'detail-head');
+    const line = termin.find('detail-head__subtitle');
+    assert.equal(line.find('detail-head__dot').styles['--detail-accent'], '#00668F', 'der Punkt traegt die Kalenderfarbe');
+    assert.equal(line.find('detail-head__dot').attrs['aria-hidden'], 'true');
+    assert.equal(line.text, 'Wann: Heute, 20:00 - 22:00');
+    assert.equal(line.find('sr-only').textContent, 'Wann: ', 'das Label ist nur fuer Screenreader');
+    const people = termin.find('detail-head__people');
+    assert.equal(people.tagName, 'UL');
+    assert.equal(people.attrs['aria-label'], 'Zugewiesen');
+    const persons = people.all('detail-head__person');
+    assert.equal(persons.length, 2, 'eine Person ohne Namen steht nicht da');
+    assert.equal(persons[0].find('detail-head__name').textContent, 'Emma <b>Johnson</b>', 'der Name ist Text, kein Markup');
+    const scheibe = persons[0].find('detail-head__avatar');
+    assert.equal(scheibe.attrs['aria-hidden'], 'true', 'die Scheibe ist Schmuck neben dem Namen');
+    assert.equal(scheibe.styles['background-color'], '#CE2A63', 'Identitaetsfarbe der Person');
+    assert.ok(scheibe.styles.color, 'mit lesbarer Tinte darauf');
+    assert.match(scheibe.textContent, /^E/, 'Initialen');
+    const bild = persons[1].find('detail-head__avatar').children[0];
+    assert.equal(bild.tagName, 'IMG');
+    assert.equal(bild.alt, '', 'das Bild wiederholt den Namen nicht');
+
+    // Geburtstag: Bild gross, hoechstens zwei Kennzahlen.
+    const media = new El('div');
+    const geburtstag = detailHeadEl({ media, facts: ['wird 41', '', 'in 26 Tagen', 'zu viel'] });
+    assert.equal(geburtstag.className, 'detail-head detail-head--media');
+    assert.equal(geburtstag.find('detail-head__media').children[0], media);
+    assert.deepEqual(geburtstag.all('detail-head__fact').map((f) => f.textContent), ['wird 41', 'in 26 Tagen']);
+    assert.equal(geburtstag.find('detail-head__subtitle'), null);
+  } finally {
+    for (const [k, d] of Object.entries(saved)) {
+      if (d) Object.defineProperty(globalThis, k, d); else delete globalThis[k];
+    }
+  }
+
+  // Der Koerper: mit Farbpunkt im Kopf entfaellt der Farbstreifen; der Kopf steht vor den Zeilen.
+  const src = await detailJs();
+  const bodyFn = src.slice(src.indexOf('function detailBodyEl('), src.indexOf('function detailGroupEl('));
+  assert.match(bodyFn, /const headEl = detailHeadEl\(head\);\s*if \(headEl\) view\.appendChild\(headEl\);/);
+  assert.match(bodyFn, /if \(accentColor && !\(headEl && head\.dot\)\)/, 'dieselbe Farbe stuende sonst zweimal da');
+  assert.ok(bodyFn.indexOf('detailHeadEl(head)') < bodyFn.indexOf("rows.className = 'detail-view__rows'"));
+  // Popover, Blatt und Spalte tragen den Titel in Title 3.
+  const typo = await read('public/styles/typography.css');
+  const { eachRule } = await import('./css-rules.js');
+  const role = [...eachRule(typo)].filter((r) => r.selector.split(',').some((s) => s.trim() === '.detail-popover__title'));
+  assert.equal(role.length, 1, 'das Popover hat genau EINE Rolle in der Rollenschicht');
+  assert.match(role[0].body, /font-size:\s*var\(--type-section-title\)/, 'derselbe Termin trug im Popover 17px und im Blatt 20px');
+  assert.doesNotMatch(await detailCss(), /\.detail-popover__title \{[^}]*font-size/, 'die Groesse steht in der Rollenschicht, nicht am Bauteil');
 });
 
 // Die Zeilen, die beide Module wortgleich bauten, wohnen jetzt an einer Stelle.
@@ -959,6 +1069,8 @@ test('Klick neben das Popover schliesst es und loest darunter nichts aus', async
     }
     setAttribute(k, v) { this.attrs[k] = String(v); }
     getAttribute(k) { return this.attrs[k] ?? null; }
+    // R18: das geschlossene Popover gibt seine Kennung sofort frei (leavePopover).
+    removeAttribute(k) { delete this.attrs[k]; if (k === 'id') this.id = ''; }
     appendChild(c) { if (c && typeof c === 'object') c.parent = this; this.children.push(c); return c; }
     append(...cs) { cs.forEach((c) => this.appendChild(c)); }
     replaceChild(next, prev) { const i = this.children.indexOf(prev); this.children[i] = next; next.parent = this; }
@@ -1080,4 +1192,142 @@ test('Klick neben das Popover schliesst es und loest darunter nichts aus', async
       if (d) Object.defineProperty(globalThis, k, d); else delete globalThis[k];
     }
   }
+});
+
+// R19 (Critique 2026-10-16): Inventar-Detail mobil - Label ueber dem Wert,
+// 45px je Feld (565px fuer zwoelf Zeilen). Die Info-Listen-Form stellt Label
+// und Wert einer Textzeile schmal in EINE Zeile (371px); opt-in je Leseansicht.
+test('R19: schmal stehen Label und Wert einer Textzeile in einer Zeile, wo die Ansicht es waehlt', async () => {
+  const dv = await read('public/components/detail-view.js');
+  const css = await read('public/styles/detail-view.css');
+  const inv = await read('public/pages/inventory.js');
+  assert.match(dv, /function detailBodyEl\(\{ accentColor, head, sections = \[\], rowLayout = 'stacked' \}\)/);
+  assert.match(dv, /rowLayout === 'inline' \? 'detail-view detail-view--inline-rows' : 'detail-view'/);
+  assert.match(dv, /!\(node instanceof HTMLElement\) && 'detail-row--text'/, 'nur reine Textwerte - Chips, Listen und Bild bleiben untereinander');
+  assert.match(inv, /rowLayout: 'inline',/, 'das Inventar waehlt die Form');
+  const { eachRule } = await import('./css-rules.js');
+  const inline = [...eachRule(css)].filter((r) => r.at.some((a) => /max-width:\s*767px/.test(a))
+    && r.selector.includes('.detail-view--inline-rows .detail-row--text:not(.detail-row--multiline)'));
+  const text = inline.find((r) => r.selector.trim().endsWith('> .detail-row__text'));
+  assert.match(text?.body ?? '', /flex-flow:\s*row wrap/, 'eine Zeile, ein langer Wert bricht unter das Label');
+  assert.ok(inline.some((r) => r.selector.trim().endsWith('.detail-row__value') && /text-align:\s*end/.test(r.body)), 'der Wert am Ende');
+});
+
+// R19 (Critique 2026-10-16, Heuristik 3): "Aufgabe bearbeiten" hatte mobil vier
+// Auswege - Zurueck, x, Abbrechen, Papierkorb. Im Formular einer Leseansicht
+// ist Abbrechen jetzt der eine Rueckweg in die Leseansicht, der Kopfknopf
+// "Zurueck" faellt dann weg; und der Countdown liegt ausgeschaltet hinter
+// "Weitere Einstellungen" wie Wiederholung und Erinnerung.
+test('R19: im Formular einer Leseansicht fuehrt Abbrechen zurueck, der Kopf traegt kein zweites Zurueck', async () => {
+  const dv = await read('public/components/detail-view.js');
+  const form = dv.slice(dv.indexOf('async function switchToForm('), dv.indexOf('function switchToDetail('));
+  assert.match(form, /state\.formCancel = state\.formFooter\?\.querySelector\('\[data-action="close-modal"\]'\) \?\? null;/);
+  assert.match(form, /state\.formCancel\?\.addEventListener\('click', \(event\) => \{[\s\S]*?event\.stopImmediatePropagation\(\);\s*switchToDetail\(panel, opts, state\);[\s\S]*?\}, \{ capture: true \}\);/,
+    'vor dem delegierten close-modal der Seite, und nur im Formular');
+  assert.match(form, /label: t\('common\.back'\),\s*onClick: \(\) => switchToDetail\(panel, opts, state\),\s*hidden: Boolean\(state\.formCancel\),/,
+    'mit Abbrechen im Fuss kein Kopf-Zurueck');
+  const tasks = await read('public/pages/tasks.js');
+  assert.match(tasks, /const countdownTucked = !task\?\.countdown;/);
+  assert.match(tasks, /\$\{countdownTucked \? '' : countdownHtml\}/, 'ein gesetzter Countdown bleibt im Hauptteil');
+  assert.match(tasks, /\$\{countdownTucked \? `<div class="task-form__tucked">\$\{countdownHtml\}<\/div>` : ''\}/, 'ausgeschaltet hinter dem Aufklapper');
+  assert.match(tasks, /countdown \? t\('dashboard\.countdownTitle'\) : null,/, 'und die Zeile des Aufklappers nennt ihn');
+});
+
+// R19 (Critique 2026-10-16, "Bearbeiten: mal gefuellt primaer, mal umrandet
+// sekundaer"): Bearbeiten ist in Blatt, Popover und Detailspalte EIN
+// gefuellter Knopf am Ende des Fusses; ein anderer Primaerknopf (Aufgabe:
+// Erledigen) tritt dort zurueck.
+test('R19: Bearbeiten ist ueberall der eine Primaerknopf am Ende des Fusses', async () => {
+  const src = await detailJs();
+  // withPrimaryEdit als Programm: die Funktion ist rein und haengt an keinem
+  // Import, also laeuft ihr Quelltext hier fuer sich.
+  const fnSrc = src.slice(src.indexOf('export function withPrimaryEdit('), src.indexOf('export function detailFooterEl('));
+  const withPrimaryEdit = new Function(`${fnSrc.replace('export function', 'function')}; return withPrimaryEdit;`)();
+  const out = withPrimaryEdit([
+    { id: 'finish', variant: 'primary' }, { id: 'archive', variant: 'ghost' }, null,
+  ], { id: 'edit', label: 'Bearbeiten', onClick() {} });
+  assert.deepEqual(out.map((a) => [a.id, a.variant]), [['finish', 'secondary'], ['archive', 'ghost'], ['edit', 'primary']]);
+  assert.equal(out.at(-1).icon, 'pencil');
+  assert.deepEqual(withPrimaryEdit([{ id: 'finish', variant: 'primary' }], null).map((a) => a.variant), ['primary'],
+    'ohne Bearbeiten bleibt der Primaerknopf des Aufrufers');
+  // DIE AUSNAHME DER AUFGABE (Ulas 2026-10-16): `keepPrimary` laesst den
+  // eigenen Primaerknopf stehen, Bearbeiten tritt sekundaer DAVOR - und auch
+  // dann gibt es genau einen gefuellten Knopf.
+  const kept = withPrimaryEdit([
+    { id: 'archive', variant: 'ghost' }, { id: 'finish', variant: 'primary' }, { id: 'other', variant: 'primary' },
+  ], { id: 'edit', onClick() {} }, { keepPrimary: true });
+  assert.deepEqual(kept.map((a) => [a.id, a.variant]),
+    [['archive', 'ghost'], ['edit', 'secondary'], ['finish', 'primary'], ['other', 'secondary']]);
+  assert.deepEqual(withPrimaryEdit([{ id: 'archive', variant: 'ghost' }], { id: 'edit' }, { keepPrimary: true }).map((a) => [a.id, a.variant]),
+    [['archive', 'ghost'], ['edit', 'primary']], 'ohne eigenen Primaerknopf wird Bearbeiten primaer');
+  const pane = src.slice(src.indexOf('function openInPane('), src.indexOf('// Öffentliche API'));
+  assert.match(pane, /detailPaneHeaderEl\(\{ title: opts\.title \?\? '' \}\)/, 'die Detailspalte traegt Bearbeiten nicht mehr im Kopf');
+  assert.match(pane, /detailFooterEl\(withPrimaryEdit\(opts\.actions, edit, \{ keepPrimary: opts\.keepPrimary \}\), close\)/, 'sondern am Ende ihres Fusses');
+  assert.match(src, /if \(action\.dock\) dockNextModal\(btn\.closest\('\.split-view__detail'\)\)/, 'das Formular legt sich weiter in die Spalte');
+  assert.doesNotMatch(src, /opts\.edit\??\.primary/, 'keine Option mehr, die Bearbeiten zuruecknimmt');
+  for (const page of ['inventory', 'contacts', 'calendar']) {
+    const js = readFileSync(new URL(`../public/pages/${page}.js`, import.meta.url), 'utf8');
+    assert.doesNotMatch(js, /^\s*primary: true,$/m, `${page}: tote Option edit.primary`);
+  }
+  // Die Aufgabe auf dem Telefon: mit Bearbeiten am Ende bleibt der Fuss EINE
+  // Reihe - Loeschen tritt zu Starten und Archivieren ins Mehr-Menue (dort
+  // weiter destruktiv gefaerbt), Bearbeiten steht als Stift vor dem vollen
+  // Erledigen (Ulas 2026-10-16).
+  const task = readFileSync(new URL('../public/components/task-detail.js', import.meta.url), 'utf8');
+  assert.match(task, /const overflowIds = \['task-detail-start', 'task-detail-archive', 'task-detail-delete'\];/);
+  const more = task.slice(task.indexOf('function wireDetailMoreMenu('), task.indexOf('const DOER_BUTTON_ID'));
+  assert.match(more, /popover-menu__item--danger/, 'Loeschen bleibt im Menue destruktiv');
+  const css = await detailCss();
+  assert.doesNotMatch(css, /#task-detail-finish > \.btn__label/, 'Erledigen mobil wieder als voller Knopf');
+  assert.match(css, /\.detail-view__footer:has\(> \.task-detail__more\) > #detail-view-edit > \.btn__label \{/, 'Bearbeiten mobil als Stift ohne Wort');
+  assert.match(task, /keepPrimary: true,/, 'die Aufgabe behaelt ihren Primaerknopf');
+  const recipes = readFileSync(new URL('../public/pages/recipes.js', import.meta.url), 'utf8');
+  const recipePane = recipes.slice(recipes.indexOf('function renderRecipePane('), recipes.indexOf('function openRecipeNarrow('));
+  assert.match(recipePane, /withPrimaryEdit\(/, 'die Rezeptspalte folgt derselben Regel');
+});
+
+// Re-Critique 2026-10-17 (A4 P3): im Inventar stand der 2px-Streifen im
+// Modulton 16px unter der Haarlinie der Kopfzeile - eine Doppellinie, die
+// nichts sagte (das Modul nennt der Kopf der Seite). Ein Streifen traegt eine
+// Aussage (Marken-, Kalenderfarbe), nie nur den Modulton - wie seit R18 bei
+// Geburtstagen und Terminen.
+test('R20: keine Leseansicht zieht einen Farbstreifen im blossen Modulton', async () => {
+  const { readdirSync } = await import('node:fs');
+  const dir = new URL('../public/pages/', import.meta.url);
+  const hits = [];
+  for (const file of readdirSync(dir).filter((f) => f.endsWith('.js'))) {
+    const src = readFileSync(new URL(file, dir), 'utf8');
+    for (const m of src.matchAll(/accentColor:\s*'var\(--module-[a-z-]+\)'/g)) hits.push(`${file}: ${m[0]}`);
+  }
+  assert.deepEqual(hits, []);
+});
+
+/* Fremde Adressen als Link: nur http(s) wird zum href. Die Website eines
+ * Kontakts kommt ungeprueft aus dem vCard-Feld URL (CardDAV), die Rezept-URL
+ * aus Formular, API und Rezept-Anbietern. Stand dort `javascript:...`, wurde es
+ * ein klickbarer Link - heute bremst das nur die CSP (script-src ohne
+ * unsafe-inline), eine zweite Schicht gab es nicht.
+ */
+test('externalHref laesst nur http(s) als Linkziel durch', async () => {
+  const { externalHref } = await import('../public/utils/html.js');
+  assert.equal(typeof externalHref, 'function', 'utils/html.js exportiert externalHref');
+  assert.equal(externalHref('https://example.org/a?b=1'), 'https://example.org/a?b=1');
+  assert.equal(externalHref('  HTTP://example.org  '), 'HTTP://example.org');
+  assert.equal(externalHref('javascript:alert(1)'), '');
+  assert.equal(externalHref(' JavaScript:alert(1)'), '');
+  assert.equal(externalHref('data:text/html,<b>x</b>'), '');
+  assert.equal(externalHref('www.example.org'), '', 'ohne Schema kein relativer Link in die App');
+  assert.equal(externalHref(null), '');
+});
+
+test('Kontakt-Website und Rezept-URL laufen durch externalHref', async () => {
+  const contacts = await read('public/pages/contacts.js');
+  assert.match(contacts, /externalHref\(contact\.website\)/, 'contacts.js: Website');
+  assert.doesNotMatch(contacts, /href: contact\.website\b/, 'contacts.js: roher Wert als href');
+  const recipes = await read('public/pages/recipes.js');
+  assert.match(recipes, /externalHref\(recipe\.recipe_url\)/, 'recipes.js: Rezept-Link');
+  assert.doesNotMatch(recipes, /link\.href = recipe\.recipe_url/, 'recipes.js: roher Wert als href');
+  const meals = await read('public/pages/meals.js');
+  assert.match(meals, /externalHref\(meal\.recipe_url\)/, 'meals.js: Rezept-Knopf der Mahlzeitkarte');
+  assert.doesNotMatch(meals, /href="\$\{esc\(meal\.recipe_url\)\}"/, 'meals.js: roher Wert als href');
 });

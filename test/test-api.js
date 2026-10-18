@@ -32,7 +32,7 @@ function mockResponse(status, body = {}, headers = {}) {
   });
 }
 
-const { api, auth, ApiError } = await import('../public/api.js');
+const { api, auth, ApiError, isAbortError } = await import('../public/api.js');
 const { buildOpenApiSpec } = await import('../server/openapi.js');
 
 function setup() {
@@ -802,6 +802,17 @@ const REASONS_READ_BY_A_PAGE = new Map([
   ['ATTACHMENT_CHANGE_REFUSED', 'pages/calendar.js'],
   ['ATTACHMENT_UPLOAD_REFUSED', 'pages/calendar.js'],
   ['FOLDER_DOCUMENTS_NOT_MANAGEABLE', 'utils/document-folder-delete.js'],
+  // Gravatar-Import (#1791): GRAVATAR_REASON_KEYS auf der Kontoseite. Einen
+  // Gast erreicht der Knopf gar nicht (gravatarAvailable), der Satz steht fuer
+  // einen Aufruf, der an der Oberflaeche vorbei kommt.
+  ['not_a_household_member', 'settings/pages/personal-account.js'],
+  // Installieren, Loeschen und Einschalten eines Moduls mit einem API-Token:
+  // beide Blaetter (Eigenes Modul hinzufuegen, Aktive Module) nehmen den Satz
+  // aus dieser Datei.
+  ['module_session_required', 'settings/module-install-errors.js'],
+  // Der Betreiber hat MODULES_ALLOW_WEB_INSTALL nicht gesetzt (DECISIONS.md 12):
+  // das Blatt zeigt dann den Weg von Hand, mit demselben Satzvorrat.
+  ['module_web_install_disabled', 'settings/module-install-errors.js'],
 ]);
 
 const REASONS_WITHOUT_SENTENCE = new Set([
@@ -853,22 +864,58 @@ const REASONS_PASSED_THROUGH = new Map([
   ['routes/health/visibility-defaults.js: error.reason', { sites: 1, at403: [['FASTING_CAPABILITY_REQUIRED', 'services/fasting.js']],
     why: 'requireFastingCapability wirft nur diesen' }],
   ['routes/split-expenses.js: err.reason', { sites: 1, at403: [],
-    why: 'Refusal: ein Grund nur an 409 (email_in_use); die 403 dort tragen keinen' }],
+    why: 'Refusal: ein Grund nur an 409 (email_in_use, group_archived); die 403 dort tragen keinen' }],
   ['auth.js: err.code', { sites: 1, at403: [], why: 'feste 409 (2FA)' }],
+  // Gravatar-Import: GravatarError traegt seinen Grund, die Route schlaegt den
+  // Status nach (400/404/413/415/502, 500 bei falsch gesetzter GRAVATAR_BASE_URL)
+  // - eine 403 baut sie daraus nie. Ihre eigene 403 (not_a_household_member)
+  // und 409 (gravatar_stale) stehen als Literal an der Stelle, die des
+  // Wandtabletts kommt mit Literal vom Riegel.
+  // Die zweite Stelle ist die Logzeile daneben, keine Antwort.
+  ['auth.js: err.reason', { sites: 2, at403: [], why: 'Gravatar-Import: 400/404/413/415/502 oder 500, nie 403' }],
   ['routes/notes.js: result.reason', { sites: 1, at403: [], why: 'feste 409' }],
+  // SMTP (Re-Critique 2026-10-17): die Absage beim Speichern und der Fall der
+  // Testmail. Beides reist an einer festen 400 bzw. in einer 200, nie an 403.
+  ['routes/email.js: refusal.reason', { sites: 1, at403: [], why: 'emailConfigRefusal: feste 400' }],
+  ['services/email.js: smtpFailureReason(err)', { sites: 1, at403: [], why: 'sendTest: in der 200-Antwort von POST /email/test' }],
   ['routes/family.js: problem.reason', { sites: 1, at403: [], why: 'memberOrderProblem: feste 400; die 403 daneben traegt ein Literal' }],
+  // parseDataUrl (#1909): der Fall einer gewaehlten Datei (Typ, Inhalt, leer).
+  ['routes/documents.js: parsed.reason', { sites: 1, at403: [], why: 'parseDataUrl: feste 400' }],
+  // problemBody (#1909): der Grund einer Abo-Pruefung, nur bei genau einem Befund.
+  ['routes/subscriptions.js: items[0].reason', { sites: 1, at403: [], why: 'problemBody: feste 400' }],
   ['routes/tasks.js: result.reason', { sites: 1, at403: [], why: 'feste 409' }],
   ['routes/backup.js: err.reason', { sites: 1, at403: [], why: 'Restore: 409, 503 oder 400' }],
+  // wasteErrorResponse (#1795, #1909): der Grund eines getypten Abfuhr-Fehlers
+  // haengt an seinem Zweig - 400 (WasteValidationError), 409 (WasteConflictError:
+  // preview_changed, source_changed, refresh_in_progress, waste_type_in_use,
+  // waste_pickup_exists) oder 404 (WasteNotFoundError). Eine 403 gibt es dort nicht.
+  ['routes/waste/helpers.js: err.reason', { sites: 3, at403: [], why: 'feste 400, 409 oder 404' }],
+  // classifyFetchFailure (#1909): die Klasse eines gescheiterten Abrufs einer
+  // Quelle mit Adresse, aus einem WasteFetchError oder aus der Validierung der
+  // gespeicherten Adresse. Sie reist als 502 (Vorschau/Uebernahme) oder im
+  // Rumpf einer 200/201 mit `outcome: 'error'` - nie an einer 403.
+  // #1938: auch die Antwort ohne einen Kalendereintrag (waste_source_fetch_no_events)
+  // kommt als WasteFetchError durch diese zwei Stellen, keine dritte.
+  ['services/waste-url-source.js: err.reason', { sites: 2, at403: [], why: 'Rueckgabewert einer Einordnung, wird zur 502 oder zu outcome error' }],
+  // validateOneOff reicht den Grund seiner Pruefung (waste_pickup_date_invalid)
+  // an den Store, der daraus einen WasteValidationError baut: keine Antwort,
+  // und am Ende eine 400.
+  ['services/waste-domain.js: checks.find((check) => check.error && check.reason)?.reason ?? null',
+    { sites: 1, at403: [], why: 'Rueckgabewert einer Pruefung, wird zur 400' }],
   // refuse() (#1656, #1668): die eine Stelle, ueber die jede Absage der
   // Budget-Routen ihren Grund bekommt. Ihr Status ist 400 oder, an zwei
   // Stellen ausgeschrieben, 409 - eine 403 baut sie nie.
   ['routes/budget/helpers.js: first.reason', { sites: 1, at403: [], why: '400 oder 409' }],
   ['routes/budget/loans.js: derived.reason', { sites: 1, at403: [], why: 'Vorschau: 200 mit ok: false' }],
+  ['routes/modules.js: err.reason', { sites: 2, at403: [],
+    why: 'sendInstallError: InstallError traegt nur 400-429 und 502/503 (REASON_STATUS in services/module-install.js); '
+      + 'PATCH /:id: setModuleEnabled setzt nur busy (409) und not_writable (503); '
+      + 'die beiden 403 der Modul-Installation (module_web_install_disabled, module_session_required) schickt die Route als Literal, vor dem Body' }],
   ['services/document-deletion-lock.js: err.reason', { sites: 1, at403: [], why: 'feste 409' }],
   ['middleware/error-handler.js: err.reason', { sites: 1, at403: [], why: 'feste 503' }],
   ['middleware/restore-gate.js: RESTORE_IN_PROGRESS_REASON', { sites: 1, at403: [], why: '503 oder 409' }],
   ['routes/weather.js: WEATHER_REASON.NOT_CONFIGURED', { sites: 1, at403: [], why: 'Antwort 200 ohne Daten' }],
-  ['routes/weather.js: WEATHER_REASON.UPSTREAM_ERROR', { sites: 3, at403: [], why: 'Antwort 200 ohne Daten' }],
+  ['routes/weather.js: WEATHER_REASON.UPSTREAM_ERROR', { sites: 5, at403: [], why: 'Antwort 200 ohne Daten (Wetter 3x, Ortssuche 2x)' }],
   ['routes/rewards.js: item.name', { sites: 1, at403: [], why: 'Buchungstext im Punktekonto, keine Antwort' }],
   ['routes/rewards.js: row.reward_name', { sites: 1, at403: [], why: 'Buchungstext im Punktekonto, keine Antwort' }],
   ['routes/rewards.js: row.note', { sites: 1, at403: [], why: 'Buchungstext im Taschengeldkonto (#1734), keine Antwort' }],
@@ -1135,4 +1182,193 @@ test('OpenAPI beschreibt language und timezone als optionale Setup-Felder', () =
   assert.equal(schema.properties.timezone?.type, 'string');
   assert.deepEqual(schema.required, ['username', 'display_name', 'password']);
   assert.ok(openApi.paths['/api/v1/auth/setup'].post.responses[400]);
+});
+
+// ─── api.get(path, { signal }) (Critique R18) ────────────────────────────────
+
+/** Ein fetch, das wie der Browser erst antwortet, wenn es abgebrochen wird. */
+function abortableFetch(calls = []) {
+  return (url, opts) => {
+    calls.push({ url, opts });
+    return new Promise((resolve, reject) => {
+      const fail = () => reject(opts.signal.reason ?? Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      if (opts.signal?.aborted) return fail();
+      opts.signal?.addEventListener('abort', fail, { once: true });
+      // Ohne Signal haengt der Test nicht ewig: nach kurzer Frist kommt die Antwort.
+      setTimeout(() => resolve(mockResponse(200, { data: 'late' })), 50);
+      return undefined;
+    });
+  };
+}
+
+test('api.get reicht Optionen durch: das Signal kommt bei fetch an, die Methode bleibt GET', async () => {
+  setup();
+  const calls = [];
+  _mockFetch = (url, opts) => { calls.push({ url, opts }); return mockResponse(200, { data: 1 }); };
+  const controller = new AbortController();
+
+  await api.get('/tasks', { signal: controller.signal, method: 'DELETE' });
+
+  assert.equal(calls[0].opts.signal, controller.signal);
+  assert.equal(calls[0].opts.method, 'GET', 'ein opts darf aus einem GET nichts anderes machen');
+});
+
+test('api.get: ein abgebrochener Abruf wirft einen erkennbaren AbortError', async () => {
+  setup();
+  _mockFetch = abortableFetch();
+  const controller = new AbortController();
+  const pending = api.get('/tasks', { signal: controller.signal });
+  controller.abort();
+
+  await assert.rejects(pending, (err) => {
+    assert.equal(isAbortError(err), true);
+    assert.equal(err.name, 'AbortError');
+    assert.equal(err.status, undefined, 'kein ApiError: es gab keine Antwort');
+    return true;
+  });
+});
+
+test('api.get: der Abbruchgrund des Aufrufers aendert nichts an der Erkennbarkeit', async () => {
+  setup();
+  _mockFetch = abortableFetch();
+  const controller = new AbortController();
+  const pending = api.get('/tasks', { signal: controller.signal });
+  // Mit einem eigenen Grund wirft fetch DIESEN, kein DOMException.
+  controller.abort(new TypeError('Seite verlassen'));
+
+  await assert.rejects(pending, (err) => isAbortError(err));
+});
+
+test('ein Abbruch waehrend des Rumpfs ist ein Abbruch, keine leere Erfolgsantwort', async () => {
+  setup();
+  const controller = new AbortController();
+  _mockFetch = () => Promise.resolve({
+    status: 200,
+    ok: true,
+    headers: { get: () => null, has: () => false },
+    json: () => { controller.abort(); return Promise.reject(Object.assign(new Error('aborted'), { name: 'AbortError' })); },
+  });
+
+  await assert.rejects(api.get('/tasks', { signal: controller.signal }), (err) => isAbortError(err));
+});
+
+test('ein abgebrochener Schreibvorgang heisst nicht "offline"', async () => {
+  setup();
+  _mockFetch = abortableFetch();
+  const controller = new AbortController();
+  const pending = api.post('/tasks', { title: 'x' }, { signal: controller.signal });
+  controller.abort();
+
+  await assert.rejects(pending, (err) => {
+    assert.equal(isAbortError(err), true);
+    assert.notEqual(err.message, 'offline');
+    return true;
+  });
+});
+
+test('ohne Signal bleibt ein Netzfehler, was er war', async () => {
+  setup();
+  _mockFetch = () => Promise.reject(new TypeError('Failed to fetch'));
+  await assert.rejects(api.get('/tasks'), (err) => err instanceof TypeError && !isAbortError(err));
+  await assert.rejects(api.post('/tasks', {}), (err) => err instanceof ApiError && err.message === 'offline');
+});
+
+test('der Sammelhandler im Router zeigt fuer einen Abbruch keinen Fehler-Toast', async () => {
+  const { readFileSync } = await import('node:fs');
+  const router = readFileSync(new URL('../public/router.js', import.meta.url), 'utf8');
+  const handler = router.match(/addEventListener\('unhandledrejection', \(e\) => \{([\s\S]*?)\n\}\);/)?.[1];
+  assert.ok(handler, 'Handler nicht gefunden');
+  // Als PROGRAMM gefahren, nicht nur gelesen: der Rumpf laeuft mit Attrappen.
+  const run = (reason) => {
+    const seen = { toasts: 0, prevented: 0 };
+    const fn = new Function('e', 'isAbortError', 'showToast', 'friendlyError', 'console', handler);
+    fn({ reason, preventDefault: () => { seen.prevented += 1; } }, isAbortError, () => { seen.toasts += 1; }, (x) => String(x), { error() {} });
+    return seen;
+  };
+  const controller = new AbortController();
+  _mockFetch = abortableFetch();
+  const pending = api.get('/tasks', { signal: controller.signal });
+  controller.abort();
+  const abortErr = await pending.catch((err) => err);
+
+  assert.deepEqual(run(abortErr), { toasts: 0, prevented: 1 });
+  assert.deepEqual(run(new Error('kaputt')), { toasts: 1, prevented: 1 }, 'jeder andere Fehler meldet sich weiter');
+});
+
+// ─── auth.me({ quietExpiry }) - die Vorab-Frage des Starts (Critique R18) ────
+
+test('auth.me({ quietExpiry }): ein 401 feuert kein auth:expired und traegt den Status', async () => {
+  setup();
+  _mockFetch = () => mockResponse(401, { error: 'Not authenticated.' });
+
+  await assert.rejects(auth.me({ quietExpiry: true }), (err) => err.status === 401);
+  assert.equal(dispatchedEvents.filter((e) => e.type === 'auth:expired').length, 0);
+});
+
+test('auth.me() ohne die Option meldet das Sitzungsende wie bisher', async () => {
+  setup();
+  _mockFetch = () => mockResponse(401, { error: 'Not authenticated.' });
+
+  await assert.rejects(auth.me());
+  assert.equal(dispatchedEvents.filter((e) => e.type === 'auth:expired').length, 1);
+});
+
+// Critique R19: der Auth-Guard schickt NUR bei einem 401 zur Anmeldung. Ohne den
+// Status am Wurf waere ein Sitzungsende von einem Netzabbruch nicht zu trennen.
+test('auth.me() ohne die Option traegt den Status 401 auch am Wurf', async () => {
+  setup();
+  _mockFetch = () => mockResponse(401, { error: 'Not authenticated.' });
+
+  await assert.rejects(auth.me(), (err) => err.status === 401);
+});
+
+test('auth.me(): 429 und 503 tragen ihren Status und Retry-After, kein auth:expired', async () => {
+  for (const status of [429, 503]) {
+    setup();
+    _mockFetch = () => mockResponse(status, { error: 'Busy.' }, { 'Retry-After': '7' });
+    await assert.rejects(auth.me(), (err) => err.status === status && err.retryAfter === '7');
+    assert.equal(dispatchedEvents.filter((e) => e.type === 'auth:expired').length, 0, String(status));
+  }
+});
+
+test('quietExpiry ist keine fetch-Option und erreicht fetch nicht', async () => {
+  setup();
+  let seen;
+  _mockFetch = (url, opts) => { seen = opts; return mockResponse(200, { user: { id: 1 } }); };
+  await auth.me({ quietExpiry: true });
+  assert.equal('quietExpiry' in seen, false);
+});
+
+// R20 (Re-Critique 2026-10-17 a6 P2, Kaltstart): boot-fetch.js fragt Sitzung,
+// Einstellungen und die Uebersicht im <head> an, parallel zu den Modulen;
+// api.js holt die Antwort beim ersten passenden GET ab - einmal, nur Erfolge,
+// und eine schreibende Anfrage verwirft den Rest.
+test('R20: der Start reicht seine Vorab-Antworten an api.get weiter - einmal, nur Erfolge', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../public/boot-fetch.js', import.meta.url), 'utf8');
+  const asked = [];
+  const savedLocation = global.location;
+  global.location = { pathname: '/' };
+  global.document.documentElement = { lang: 'en' };
+  _mockFetch = (url) => { asked.push(url); return mockResponse(url.endsWith('/preferences') ? 401 : 200, { from: 'boot', url }); };
+  global.window.fetch = (...args) => global.fetch(...args);
+  try {
+    new Function(src)();
+    assert.deepEqual(asked.sort(), ['/api/v1/auth/me', '/api/v1/modules', '/api/v1/preferences', '/api/v1/version'],
+      'der Start fragt nicht (oder mehr als) Sitzung, Version, Einstellungen und Module vorab');
+    asked.length = 0;
+    _mockFetch = (url) => { asked.push(url); return mockResponse(200, { from: 'net', url }); };
+    const version = await api.get('/version');
+    assert.equal(version.from, 'boot', 'der Start fragt ein zweites Mal, statt die Vorab-Antwort zu nehmen');
+    assert.deepEqual(asked, []);
+    assert.equal((await api.get('/version')).from, 'net', 'eine Vorab-Antwort gilt nur einmal');
+    assert.equal((await api.get('/preferences')).from, 'net', 'eine 401 von vor dem Anmelden wird weitergereicht');
+    await api.post('/auth/login', {}).catch(() => {});
+    assert.equal((await api.get('/modules')).from, 'net', 'nach einer schreibenden Anfrage gilt nichts Vorab-Gefragtes mehr');
+  } finally {
+    delete global.window.__yuvomiTakeBoot;
+    delete global.window.fetch;
+    global.location = savedLocation;
+    delete global.document.documentElement;
+  }
 });

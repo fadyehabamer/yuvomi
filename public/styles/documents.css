@@ -28,45 +28,10 @@
 /* .documents-toolbar__search traegt keine Breite (Re-Critique 2026-09-27, D4):
  * Breite und Stelle der Kopfsuche kommen aus page-search.css. */
 
-.documents-view-toggle {
-  display: inline-flex;
-  padding: var(--space-0h);
-  gap: var(--space-0h);
-  border-radius: var(--radius-full);
-  background: var(--color-surface-3);
-}
-
-/* EINE KOPFHOEHE (Critique 2026-09-25): gemessen standen Suche 44, dieser
- * Umschalter 48 und der Menueknopf 44 (mobil 48 / 52 / 48) nebeneinander -
- * der Well legte seine 2px Rand AUF die Zielgroesse. Die Knoepfe sind jetzt
- * genau um diesen Rand kleiner, der Well ist damit so hoch wie jedes andere
- * Kopf-Bedienelement: --target-base, am Zeiger 44, am Finger 48. Die
- * Segmente stehen als Reihe (WCAG 2.5.8, Zielgroessen-Regel in tokens.css),
- * dieselbe Rechnung wie der Ansichts-Umschalter der Aufgaben (tasks.css). */
-.documents-view-toggle__btn {
-  width: calc(var(--target-base) - 2 * var(--space-0h));
-  height: calc(var(--target-base) - 2 * var(--space-0h));
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: calc(var(--radius-full) - 2px);
-  color: var(--color-text-secondary);
-}
-
-.documents-view-toggle__btn svg {
-  width: 17px;
-  height: 17px;
-}
-
-/* Aktiv = erhabene Surface-Pille im Well, Modulton nur in der Tinte (Rezept:
- * tokens.css, Abschnitt 6c). Die Leiste selbst musste dafür ein Well werden -
- * sie stand auf --color-surface-work, also auf Weiß, und eine weiße Pille auf
- * weißem Grund ist kein Zustand. */
-.documents-view-toggle__btn--active {
-  background: var(--seg-active-bg);
-  box-shadow: var(--seg-active-shadow);
-  color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-ink), var(--color-text-primary));
-}
+/* Der Ansichts-Umschalter ist seit D1 (Critique 2026-10-16) das Kanon-Segment
+ * (`.segmented.segmented--icons`, panel.css): Well, Pille, Hoehe und Naht kommen
+ * von dort. Hier stand eine runde Eigen-Pille mit eigener Hoehenrechnung - die
+ * dritte Form derselben Bedienfrage neben Aufgaben und Kalender. */
 
 /* EIN WEG ZUR ANSICHT JE BREITE (R16, Kopfregel mobil 1a). Unter 768px stehen
  * die Werkzeuge in der Titelzeile, und die traegt kein Segment: die Ansicht
@@ -142,7 +107,7 @@
 /* Traegt keine Gruppe einen Chip (leere Ansicht, documents.js
  * renderCategoryChips), geht die Spur samt Haarlinie: ein Strich neben dem
  * Segment, hinter dem nichts kommt, waere Moebel ohne Zweck. */
-.documents-filters__chips:not(:has(.filter-chip)) {
+.documents-filters__chips:not(:has(.filter-chip:not(.documents-folder-chip))) {
   display: none;
 }
 
@@ -211,6 +176,9 @@
   align-items: start;
   gap: var(--space-4);
   padding-inline: var(--page-inline-pad);
+  /* Luft unter der Filterleiste (R18, 2026-10-07): Ordnerspalte und erste
+   * Kartenreihe begannen auf der Trennlinie der Leiste (gemessen 0px). */
+  padding-top: var(--space-4);
   /* Nur der eigene Abstand: Tab-Leiste und FAB rechnet die Shell als
    * Nachlauf (`--shell-tail`, layout.css, Kopfregel mobil 2026-09-26). */
   padding-bottom: var(--space-8);
@@ -245,35 +213,10 @@
   font-weight: var(--font-weight-semibold);
 }
 
-/* Der Auslöser der aufklappbaren Auswahl - nur unterhalb Tablet sichtbar
- * (Regel im @media-Block weiter unten). Er trägt den Ordner, in dem man steht. */
-.documents-folder-browser__toggle {
-  display: none;
-  align-items: center;
-  gap: var(--space-2);
-  flex: 1;
-  min-width: 0;
-  min-height: var(--target-base);
-  padding: var(--space-1) var(--space-2);
-  border-radius: var(--radius-sm);
-  color: var(--color-text-primary);
-  font-size: var(--text-sm);
-  font-weight: var(--font-weight-medium);
-  text-align: start;
-  transition: background-color var(--transition-fast);
-}
-
-.documents-folder-browser__toggle:hover {
-  background-color: var(--color-surface-hover);
-}
-
-.documents-folder-browser__toggle svg {
-  width: var(--icon-md);
-  height: var(--icon-md);
-  flex-shrink: 0;
-  color: var(--module-accent);
-}
-
+/* Der Auslöser der aufklappbaren Auswahl stand hier als eigene Zeile im Kopf
+ * der Ordnerspalte; seit der Critique 2026-10-16 ist er der erste Chip der
+ * Filterzeile (`.documents-folder-chip`, Regeln weiter unten). Name und Pfeil
+ * behalten ihre Klassen. */
 .documents-folder-browser__toggle-label {
   flex: 1;
   min-width: 0;
@@ -285,12 +228,18 @@
   transition: transform var(--transition-fast);
 }
 
-.documents-folder-browser__toggle[aria-expanded="true"] .documents-folder-browser__chevron {
+.documents-folder-chip[aria-expanded="true"] .documents-folder-browser__chevron {
   transform: rotate(180deg);
 }
 
 @media (prefers-reduced-motion: reduce) {
   .documents-folder-browser__chevron { transition: none; }
+}
+
+/* Der Ordner-Chip (documents.js, erster Chip der Filterzeile) gibt es nur
+ * unterhalb Tablet - am Desktop steht die Ordnerspalte offen. */
+.documents-folder-chip {
+  display: none;
 }
 
 /* Freistehendes Ziel im Kopf der Ordnerliste - kein gleichartiges Ziel engt es
@@ -554,7 +503,8 @@
   gap: var(--space-0h);
   padding: var(--space-1);
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
+  /* Form wie `.popover-menu` (layout.css): 18px, Zeilen konzentrisch. */
+  border-radius: var(--radius-glass-inner);
   background: var(--color-surface);
   box-shadow: var(--shadow-lg);
   /* Ein- und Ausgang wie `.popover-menu` (layout.css), hier rein in CSS: das
@@ -607,7 +557,7 @@
   width: 100%;
   min-height: var(--target-md);
   padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
+  border-radius: calc(var(--radius-glass-inner) - var(--space-1));
   color: var(--color-text-primary);
   font-size: var(--text-sm);
   text-align: left;
@@ -707,6 +657,36 @@
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(min(200px, calc(50% - var(--space-4) / 2)), 1fr));
   gap: var(--space-4);
+  /* KEINE GESTRECKTEN KARTEN (R18, 2026-10-07). Mit `stretch` wuchs jede Karte
+   * auf die hoechste ihrer Reihe, und weil der Textblock die Dehnung aufnahm,
+   * stand die Aktionszeile bis zu 54px unter der letzten Meta-Zeile in einem
+   * Loch. Jede Karte ist jetzt so hoch wie ihr Inhalt, die Leiste schliesst
+   * direkt an den Text an; die Oberkanten und die Vorschauen (feste Form)
+   * halten die Reihe. */
+  align-items: start;
+}
+
+/* DER LEERZUSTAND NIMMT DIE GANZE BREITE (Re-Critique 2026-10-17, A4 P2-3).
+ * Im Raster war er ein Rasterelement wie eine Karte: "Keine Treffer" stand
+ * bei 1440px in einer 203px-Zelle links, daneben 650px nichts. */
+.documents-list--grid > .documents-empty-state {
+  grid-column: 1 / -1;
+}
+
+/* EINE REIHE, EINE LINIE (Re-Critique 2026-10-17, A4 P3). Ohne Dehnung (R18,
+ * oben) ist jede Karte so hoch wie ihr Inhalt, und ein zweizeiliger Titel
+ * schob Meta und Leiste seiner Karte eine Zeile unter die der Nachbarn - die
+ * Reihe endete in Stufen (gemessen 394/414px bei 1440). Der Titel haelt im
+ * Raster deshalb immer zwei Zeilen: ein kurzer Name laesst die zweite leer,
+ * Meta und Leiste fluchten ueber die Reihe, und zwischen Meta und Leiste
+ * entsteht kein Loch (der Grund fuer R18).
+ *
+ * Subgrid waere die genauere Antwort (die Zeilen der Karten teilen), ist hier
+ * aber ausgeschlossen: die Karte ist ein Container (`container: document-card`,
+ * Kurzformen unten), und ein Container mit Layout-Eingrenzung kann kein
+ * Subgrid sein - gemessen `grid-template-rows: none`. */
+.documents-list--grid .document-card__title {
+  min-block-size: 2lh;
 }
 
 /* Lade-Zustand: Grid/Flex aufheben, damit die geteilte Skeleton-Liste
@@ -790,8 +770,27 @@
   height: 22px;
 }
 
-/* DMS-Thumbnail-Vorschau (Issue #533): das geladene Bild überlagert den
-   Kategorie-Glyph im Icon-Slot. Schlägt das Laden fehl, bleibt der Glyph. */
+/* DIE VORSCHAU IST EIN BLATT AUF EINER MULDE (R18, 2026-10-07).
+ *
+ * Bis dahin fuellte das Bild einen 4:3-Rahmen per `object-fit: cover`: von
+ * einem A4-Blatt blieb das obere Drittel, ein weisses Rechteck mit sechs
+ * Zeilen Text, das in der weissen Karte nur eine Haarlinie vom Grund trennte -
+ * und im Dark die hellste Flaeche des Bildschirms war.
+ *
+ * Jetzt: der Rahmen ist hochkant (3:4, nahe am Blatt 1:1,41) und eine Mulde
+ * (--color-fill-well); das Bild liegt GANZ darin - `width/height: auto` mit
+ * `max-*: 100%` gibt dem <img> genau die Masse der Seite, also sitzt der
+ * Schatten am Blattrand und nicht am Rahmen (`object-fit: contain` bleibt als
+ * Rueckfall fuer ein Bild ohne eigene Masse). Ein Querformat (Foto, Kassenbon)
+ * steht ebenso ganz, mit Mulde darueber und darunter.
+ *
+ * DARK: --media-sheet-opacity (tokens.css) laesst die Mulde durch das Blatt
+ * scheinen - Weiss wird zu rund #DBD9D6 und ist nicht mehr heller als der
+ * Text daneben. Kein `filter`: `.app-content *` setzt ihn per !important
+ * zurueck (glass.css, Scroll-Performance #166).
+ *
+ * DMS-Vorschauen (#533) und lokale (document-thumbs.js) teilen die Regel.
+ * Schlaegt das Laden fehl, bleibt der Kategorie-Glyph stehen. */
 .document-thumb {
   position: relative;
   overflow: hidden;
@@ -804,63 +803,29 @@
 }
 
 .document-thumb__img {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  background: var(--color-surface-2);
-  transition: transform var(--transition-base);
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: var(--radius-2xs);
+  box-shadow: var(--shadow-sm);
+  opacity: var(--media-sheet-opacity);
 }
 
-/* Die ganze Zeile ist bereits Klick-Ziel (cursor: pointer). Sobald ein Thumbnail
-   geladen ist, quittiert die kleine Kachel den Hover mit einem sanften Zoom - eine
-   kleine Bestätigung, dass diese Vorschau das Dokument öffnet. NUR die 42px-Kachel
-   der Zeile: auf der grossen Kartenvorschau schnitt derselbe Zoom den Briefkopf an,
-   und die Karte meldet den Hover schon mit ihrer Anhebung (Critique 2026-09-25). */
-.document-row__icon.document-thumb--ready:hover .document-thumb__img {
-  transform: scale(1.06);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .document-thumb__img {
-    transition: none;
-  }
-  .document-row__icon.document-thumb--ready:hover .document-thumb__img {
-    transform: none;
-  }
-}
-
-/* DIE VORSCHAU IST EIN AUSSCHNITT, KEIN ZERRBILD (Critique 2026-09-25,
- * Entscheidung 2). Jede Datei steht in einem Rahmen fester Form und fuellt ihn
- * per object-fit: cover - geschnitten, nie gestaucht (DESIGN.md, media-thumb).
- * Oben verankert, weil der Kopf eines Dokuments es erkennbar macht: Briefkopf,
- * Titel, Absender. Der Rahmen liegt als ::after UEBER dem Bild, sonst
- * verschwaende ein weisses Blatt im hellen Modus randlos in der weissen Karte. */
-.document-thumb--ready .document-thumb__img {
-  object-position: top center;
-}
-
-.document-thumb--ready::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  box-shadow: inset 0 0 0 1px var(--color-border-subtle);
-  pointer-events: none;
-}
-
-/* Die Rasterkarte traegt die grosse Vorschau oben. JEDE Karte hat den Rahmen,
- * auch ohne Bild (dann mit der Kategorie-Glyphe): eine Reihe bleibt eine Reihe,
- * und ein Bild, das erst beim Scrollen ankommt, schiebt nichts mehr zur Seite.
- * 4:3 statt 16:10 (Critique 2026-09-25): mit zwei bis drei Spalten ist die
- * Karte schmal, und der obere Ausschnitt eines Blatts (Briefkopf, Titel) liest
- * sich in einem etwas hoeheren Rahmen besser als in einem Breitbild. */
+/* Die Rasterkarte traegt die Vorschau oben. JEDE Karte hat den Rahmen, auch
+ * ohne Bild (dann mit der Kategorie-Glyphe): eine Reihe bleibt eine Reihe, und
+ * ein Bild, das erst beim Scrollen ankommt, schiebt nichts mehr zur Seite.
+ * Gemessen 1440px, vier Spalten: Rahmen 179 x 239px, Blatt 152 x 215px,
+ * Karte 394-414px (vorher 309px mit dem 4:3-Ausschnitt) - der Preis des
+ * ganzen Blatts sind rund 90px je Reihe; die dichte Sicht ist die Liste. */
 .document-card__media {
   display: flex;
   align-items: center;
   justify-content: center;
-  aspect-ratio: 4 / 3;
+  aspect-ratio: 3 / 4;
+  padding: var(--space-3);
   border-radius: var(--radius-sm);
   color: var(--color-text-tertiary);
   background: var(--color-fill-well);
@@ -879,9 +844,10 @@
   }
 }
 
+/* Nur der Anfang: das Ende ist die Deckkraft des Blatts selbst
+ * (--media-sheet-opacity), im Dark unter 1. */
 @keyframes document-thumb-in {
   from { opacity: 0; }
-  to { opacity: 1; }
 }
 
 .document-card__body {
@@ -1441,6 +1407,9 @@
    * der geteilten Grammatik, die keinen Namen kappen. */
   .documents-folder-browser__head {
     padding-inline-start: 0;
+    /* Aufgeklappt traegt der Kopf nur noch „Ordner anlegen" (der Titel ist
+     * unsichtbar, der Auslöser steht als Chip in der Filterzeile). */
+    justify-content: flex-end;
   }
 
   /* Die Ueberschrift bleibt fuer Screenreader und wandert aus dem Bild: der
@@ -1458,8 +1427,40 @@
     white-space: nowrap;
   }
 
-  .documents-folder-browser__toggle {
+  .documents-folder-chip {
+    display: inline-flex;
+  }
+
+  /* DER ORDNER-CHIP FUEHRT DIE SPUR (Critique 2026-10-16): die Spur steht
+   * damit auch ohne Facetten, und der Chip schrumpft nicht unter seinen
+   * Namen. Er traegt den gewaehlten Ordner; sein Pfeil sagt „klappt auf". */
+  .documents-filters__chips:has(.documents-folder-chip) {
     display: flex;
+  }
+
+  .documents-folder-chip {
+    flex-shrink: 0;
+    max-inline-size: 16rem;
+  }
+
+  .documents-folder-chip .documents-folder-browser__toggle-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Ein gewaehlter Ordner ist ein aktiver Filter - der Chip sagt es wie
+   * jede Facette (Aktivton), solange nicht „Alle Dokumente" gilt. */
+  .documents-folder-chip[data-folder-active] {
+    background-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-state), transparent);
+    border-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-hint), transparent);
+    color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-ink), var(--color-text-primary));
+  }
+
+  /* Zugeklappt belegt die Ordnerauswahl KEINE Zeile mehr: ihr Kopf (Titel
+   * und „Ordner anlegen") erscheint erst mit der aufgeklappten Liste. */
+  .documents-folder-browser:not(.documents-folder-browser--open) {
+    display: none;
   }
 
   .documents-folder-browser__list {
@@ -2335,6 +2336,11 @@
     max-height: none;
     border: none;
     border-radius: 0;
+  }
+
+  /* Randlos und eckig hat die Tafel keine Kante, die Licht faengt. */
+  .modal-panel:has(.document-viewer)::after {
+    content: none;
   }
 
   .modal-panel:has(.document-viewer) > .modal-panel__header {

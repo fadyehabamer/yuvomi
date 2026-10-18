@@ -40,7 +40,8 @@ import { esc } from '/utils/html.js';
  * @param {string}   opts.id             Eindeutige Panel-ID (popovertarget).
  * @param {string}   opts.label          Zugänglicher Name des Triggers.
  * @param {Array<{action: string, label: string, icon: string, id?: string|number, danger?: boolean,
- *   checked?: boolean, disabled?: boolean} | {separator: true} | {group: string, items: Array}>} opts.items
+ *   checked?: boolean, disabled?: boolean, attrs?: Record<string, string|number|boolean|null>}
+ *   | {separator: true} | {group: string, items: Array}>} opts.items
  *        `checked` macht aus dem Eintrag einen Schalter (`menuitemcheckbox`,
  *        Haken am Ende) - fuer Ansichts-Schalter wie „Verlauf zeigen", die im
  *        Werkzeugmenue stehen statt als loses Icon im Kopf. `{ separator: true }`
@@ -53,7 +54,27 @@ import { esc } from '/utils/html.js';
  *        #1205); dort wäre das Auslassungszeichen eine Falschauskunft.
  * @returns {string}
  */
-export function popoverMenuHtml({ id, label, items = [], triggerClass = 'btn btn--ghost btn--icon', icon = 'ellipsis' }) {
+/**
+ * Weitere Attribute eines Eintrags (`data-from`, `data-loan-id` ...), escaped.
+ * Ein Zeilenmenue ist eine zweite Darstellung der Knoepfe, die vorher in der
+ * Zeile standen - der delegierte Handler liest dieselben Attribute am Eintrag,
+ * die er am Knopf las. `role`, `class` und `data-action` gehoeren dem Menue.
+ */
+function itemAttrs(attrs) {
+  if (!attrs) return '';
+  return Object.entries(attrs)
+    .filter(([name, value]) => value !== false && value != null && !/^(?:role|class|type|data-action)$/.test(name))
+    .map(([name, value]) => (value === true ? ` ${esc(name)}` : ` ${esc(name)}="${esc(String(value))}"`))
+    .join('');
+}
+
+// DER STANDARD-AUSLOESER IST DIE KOPF-ICON-HAUT (D1, Critique 2026-10-16):
+// `btn--secondary btn--icon` wie Werkzeugmenue, Filter und Lupe daneben. Bis
+// dahin stand hier `btn--ghost`, und die Entsorgung zeigte ihr „..." als
+// graues Ghost-Icon neben beringten Knoepfen anderer Module - eine dritte
+// Haut fuer denselben Kopfknopf. Zeilen- und Sonderknoepfe geben ihre Klasse
+// ohnehin selbst mit (rowMenuHtml, Erledigt-von-Wahl).
+export function popoverMenuHtml({ id, label, items = [], triggerClass = 'btn btn--secondary btn--icon', icon = 'ellipsis' }) {
   const entry = (item, index) => {
     if (item.separator) return '\n    <div class="popover-menu__separator" role="separator"></div>';
     // EINE GRUPPE MIT NAMEN (Critique 2026-10-05, R16): `{ group, items }`.
@@ -77,7 +98,7 @@ export function popoverMenuHtml({ id, label, items = [], triggerClass = 'btn btn
     return `
     <button type="button" role="${role}"${checkedAttr}${item.disabled ? ' disabled' : ''}
             class="popover-menu__item${item.danger ? ' popover-menu__item--danger' : ''}"
-            data-action="${esc(item.action)}"${item.id == null ? '' : ` data-id="${esc(String(item.id))}"`}>
+            data-action="${esc(item.action)}"${item.id == null ? '' : ` data-id="${esc(String(item.id))}"`}${itemAttrs(item.attrs)}>
       <i data-lucide="${esc(item.icon)}" class="icon-md" aria-hidden="true"></i>
       <span>${esc(item.label)}</span>${trail}
     </button>`;

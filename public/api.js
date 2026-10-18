@@ -30,6 +30,20 @@ function getCsrfToken() {
 }
 
 /**
+ * Die Antwort, die boot-fetch.js fuer `url` schon angefragt hat - oder null.
+ * Eine einmal abgeholte Antwort gibt es kein zweites Mal (ihr Rumpf ist dann
+ * gelesen); nach dem Start gibt es keine mehr.
+ * @param {string} url
+ * @returns {Promise<Response>|null}
+ */
+function takeBootResponse(url) {
+  // `null`: alles Vorab-Gefragte verwerfen.
+  return typeof window !== 'undefined' && typeof window.__yuvomiTakeBoot === 'function'
+    ? window.__yuvomiTakeBoot(url)
+    : null;
+}
+
+/**
  * Zentraler Fetch-Wrapper.
  * Setzt Content-Type, handhabt 401-Redirects und parsed JSON-Fehler.
  *
@@ -44,11 +58,25 @@ async function apiFetch(path, options = {}, _retried = false) {
   const stateChanging = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method);
   // `withSource` ist KEINE fetch-Option und wird deshalb hier herausgeloest,
   // bevor der Rest weitergereicht wird.
-  const { headers: optionHeaders = {}, withSource = false, ...fetchOptions } = options;
+  // `quietExpiry` ebenso: ein 401 feuert dann KEIN `auth:expired`. Nur fuer die
+  // Vorab-Frage des Starts (utils/start-handoff.js) - dort feuert das Ereignis
+  // spaeter, wenn der Auth-Guard die Antwort abholt.
+  const { headers: optionHeaders = {}, withSource = false, quietExpiry = false, ...fetchOptions } = options;
 
   let response;
   try {
-    response = await fetch(url, {
+    // Die Vorab-Frage des Starts (boot-fetch.js): dieselbe Adresse, einmal.
+    // Scheitert sie, fragt dieser Aufruf selbst - wie ohne sie.
+    // Nur eine Erfolgsantwort zaehlt: eine 401 von vor dem Anmelden darf die
+    // Sitzung danach nicht beenden. Jede schreibende Anfrage (Anmelden,
+    // Abmelden, ...) verwirft den Rest - er gehoerte dem Stand davor.
+    if (stateChanging) takeBootResponse(null);
+    const early = method === 'GET' && !fetchOptions.body ? takeBootResponse(url) : null;
+    if (early) {
+      const answer = await early.catch(() => null);
+      if (answer?.ok) response = answer;
+    }
+    if (!response) response = await fetch(url, {
       credentials: 'same-origin',
       cache: 'no-store',
       ...fetchOptions,
@@ -59,6 +87,9 @@ async function apiFetch(path, options = {}, _retried = false) {
       },
     });
   } catch (err) {
+    // Vom Aufrufer abgebrochen (`{ signal }`): kein Netzfehler und schon gar
+    // kein "offline" - siehe ApiAbortError.
+    if (fetchOptions.signal?.aborted) throw new ApiAbortError();
     // Offline/Netzfehler bei state-changing Requests (POST/PUT/PATCH/DELETE):
     // klaren ApiError werfen statt nacktem TypeError, damit die UI eine
     // verständliche „offline"-Meldung zeigen kann (read-only Offline-Modus).
@@ -73,14 +104,22 @@ async function apiFetch(path, options = {}, _retried = false) {
     // "der Wartezustand ist abgelaufen" - beides gehört auf die Anmeldeseite
     // gesagt und nicht in einen Sitzungsabbruch übersetzt (#672).
     if (path !== '/auth/login' && path !== '/auth/2fa/verify') {
+      // Der Wurf traegt seinen Status in BEIDEN Faellen (Critique R19): nur
+      // ein 401 schickt den Auth-Guard in navigate() zur Anmeldung, jeder
+      // andere Fehler der Sitzungspruefung zeigt den Fehlerzustand der Shell.
+      const expired = Object.assign(new Error('Sitzung abgelaufen.'), { status: 401 });
+      if (quietExpiry) throw expired;
       window.dispatchEvent(new CustomEvent('auth:expired'));
-      throw new Error('Sitzung abgelaufen.');
+      throw expired;
     }
     // Für beide: fall-through zum generischen !response.ok-Handler unten.
   }
 
   // Der Rumpf wird VOR der Wiederholung gelesen: ob sie sich lohnt, steht im `reason`.
   const data = await response.json().catch(() => null);
+  // Ein Abbruch WAEHREND des Rumpfs laesst `json()` scheitern - das catch oben
+  // machte daraus `null` unter einem Status 200, also eine leere Erfolgsantwort.
+  if (fetchOptions.signal?.aborted) throw new ApiAbortError();
 
   // CSRF-Token-Desync (haeufig nach iOS-PWA-Resume): einmal GET /auth/me
   // ausfuehren um den CSRF-Token zu erneuern, dann den Request wiederholen.
@@ -104,7 +143,7 @@ async function apiFetch(path, options = {}, _retried = false) {
     const meRes = await fetch(`${API_BASE}/auth/me`, { credentials: 'same-origin', cache: 'no-store' });
     if (meRes.status === 401) {
       window.dispatchEvent(new CustomEvent('auth:expired'));
-      throw new Error('Sitzung abgelaufen.');
+      throw Object.assign(new Error('Sitzung abgelaufen.'), { status: 401 });
     }
     const meData = await meRes.json().catch(() => null);
     if (meData?.csrfToken) _csrfToken = meData.csrfToken;
@@ -214,12 +253,43 @@ class ApiError extends Error {
   }
 }
 
+/**
+ * Der Aufrufer hat seine Anfrage selbst abgebrochen (`{ signal }`).
+ *
+ * EIN EIGENER, STILLER FEHLER. Was `fetch` bei einem Abbruch wirft, haengt vom
+ * Grund ab, den der Aufrufer `abort()` mitgibt - mal ein DOMException namens
+ * AbortError, mal der Grund selbst. Hier wird daraus immer dasselbe, erkennbar
+ * ueber `isAbortError()`. Still heisst: der Sammelhandler fuer unbehandelte
+ * Ablehnungen im Router zeigt dafuer KEINEN Fehler-Toast. Eine Seite, die ihre
+ * Abrufe beim Verlassen abbricht, hat nichts falsch gemacht.
+ */
+class ApiAbortError extends Error {
+  constructor() {
+    super('Request aborted.');
+    this.name = 'AbortError';
+    this.aborted = true;
+  }
+}
+
+/**
+ * Ist dieser Fehler ein Abbruch durch den Aufrufer? Erkennt auch den rohen
+ * AbortError eines `fetch`, das nicht durch diesen Client lief.
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isAbortError(err) {
+  return err instanceof ApiAbortError || err?.name === 'AbortError';
+}
+
 // --------------------------------------------------------
 // Convenience-Methoden
 // --------------------------------------------------------
 
 const api = {
-  get: (path) => apiFetch(path, { method: 'GET' }),
+  // opts wie bei post/put/patch/delete, zuerst fuer `{ signal }`: eine Seite
+  // kann einen Abruf abbrechen, dessen Antwort niemand mehr braucht. Die
+  // Methode steht zuletzt, damit kein opts aus einem GET etwas anderes macht.
+  get: (path, opts = {}) => apiFetch(path, { ...opts, method: 'GET' }),
 
   /**
    * Wie `get`, liefert aber `{ data, fromCache }` statt nur den Rumpf.
@@ -318,8 +388,9 @@ const auth = {
       forgetLayoutHint();
     }
   },
-  me: async () => {
-    const res = await api.get('/auth/me');
+  // opts nur fuer den Start des Routers (`quietExpiry`, siehe apiFetch).
+  me: async (opts = {}) => {
+    const res = await api.get('/auth/me', opts);
     setPermissions(res?.permissions);
     // Neben den Rechten die zweite Angabe, die JEDE Seite braucht und die
     // niemand einzeln holen soll: die Haushaltsgroesse (utils/household.js).
@@ -448,4 +519,4 @@ const recipeProviders = {
   getStatus: () => api.get('/recipe-providers/status'),
 };
 
-export { api, auth, email, notifications, recipeProviders, ApiError };
+export { api, auth, email, notifications, recipeProviders, ApiError, isAbortError };

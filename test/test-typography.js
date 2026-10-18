@@ -864,6 +864,48 @@ test('die Messwoerter der Re-Critique trennen an der Basis ihres Subjekts (W1)',
 /* R16 (Critique 2026-10-05, P1 Bausteine): der Name einer Listenzeile stand in
  * vier Schnitten da (15/600, 16/400, 16/500, 17/600). Kanon ist 16px medium,
  * registriert als Rolle Zeilentitel. Gegen den Stand davor rot gelaufen. */
+// ---------------------------------------------------------------------------
+// DIE TRENNGRENZE GILT AUCH IN SAFARI (#1774)
+//
+// `hyphenate-limit-chars` kennt Safari nicht (Stand Safari 27; nur die
+// Technology Preview parst sie). Die Deklaration faellt dort weg, und
+// `hyphens: auto` trennt ohne Untergrenze: „Wertpapierde-pot". WebKit fuehrt
+// dieselbe Grenze als `-webkit-hyphenate-limit-before` / `-after`. Verlangt
+// wird das Paar in DERSELBEN Regel und mit DENSELBEN Zahlen - eine Regel, die
+// in Chromium bei 4 trennt und in Safari bei 2, ist derselbe Befund in klein.
+// Keine Anzahl, keine Dateiliste: jede Regel unter public/styles wird gefragt.
+// ---------------------------------------------------------------------------
+
+/** Regeln, deren Safari-Grenze fehlt oder von `hyphenate-limit-chars` abweicht. */
+function hyphenLimitGaps() {
+  const gaps = [];
+  let seen = 0;
+  for (const file of cssFiles) {
+    const css = readFileSync(new URL(file, STYLES_DIR), 'utf8');
+    for (const { selector, body, at } of eachRule(css)) {
+      const chars = lastDeclaration(body, 'hyphenate-limit-chars');
+      if (!chars) continue;
+      seen += 1;
+      // Kurzform nach CSS Text 4: <wort> [<vor> [<nach>]]; fehlt <nach>, gilt <vor>.
+      const [, before = 'auto', after = before] = chars.split(/\s+/);
+      const where = `${file} ${[...at, selector].join(' | ')}`;
+      for (const [prop, want] of [['-webkit-hyphenate-limit-before', before], ['-webkit-hyphenate-limit-after', after]]) {
+        const got = lastDeclaration(body, prop);
+        if (got !== want) gaps.push(`${where}: ${prop} ist "${got}", erwartet "${want}" (hyphenate-limit-chars: ${chars})`);
+      }
+    }
+  }
+  return { gaps, seen };
+}
+
+test('jede Trenngrenze steht auch in der Safari-Schreibweise, mit denselben Zahlen (#1774)', () => {
+  const { gaps, seen } = hyphenLimitGaps();
+  assert.ok(seen > 0, 'der Guard hat keine einzige hyphenate-limit-chars-Regel gefunden - er misst nichts');
+  assert.deepEqual(gaps, [],
+    'Safari kennt hyphenate-limit-chars nicht und trennt ohne Grenze. Direkt darunter '
+    + '-webkit-hyphenate-limit-before / -after mit denselben Zahlen ergaenzen.');
+});
+
 test('der Zeilentitel ist eine Rolle (R16)', () => {
   const typo = [...eachRule(readFileSync(new URL('typography.css', STYLES_DIR), 'utf8'))];
   const sels = (rule) => rule.selector.split(',').map((s) => s.trim());
@@ -904,4 +946,69 @@ test('der Zeilentitel ist eine Rolle (R16)', () => {
     }
   }
   assert.deepStrictEqual(funde, [], 'ein eigenes Gewicht am Zeilentitel ist ein Dialekt');
+});
+
+// R19 (Critique 2026-10-16, "Titel-Kuerzung: vier Regeln"): EINE Titelregel
+// fuer Listenzeilen - hoechstens zwei Zeilen, dann Ellipse. Vorher einzeilig
+// (Aufgaben, Kontakte, Geburtstage, Belohnungen, Abos, Buchungen, Agenda am
+// Desktop) oder unbegrenzt (Einkauf/Vorrat/Rezepte, Agenda mobil).
+test('R19: die Titelregel - Zeilentitel hoechstens zwei Zeilen, kein Modul weicht ab', () => {
+  const typo = [...eachRule(readFileSync(new URL('typography.css', STYLES_DIR), 'utf8'))];
+  const sels = (rule) => rule.selector.split(',').map((s) => s.trim());
+  const TITLES = ['.list-row__name', '.task-card__title', '.contact-item__name', '.subscription-card__name', '.rw-standing__name', '.agenda-event__title > span'];
+  const regel = typo.find((rule) => !rule.at.length && TITLES.every((sel) => sels(rule).includes(sel)));
+  assert.ok(regel, 'typography.css fuehrt die Titelregel fuer alle Zeilentitel');
+  assert.match(regel.body, /display:\s*-webkit-box/);
+  assert.match(regel.body, /-webkit-line-clamp:\s*2/);
+  assert.match(regel.body, /(?:^|[;\s])line-clamp:\s*2/);
+  assert.match(regel.body, /overflow:\s*hidden/);
+  // Kein Modulblatt setzt am Zeilentitel eine eigene Fassung: einzeilig,
+  // eine andere Zeilenzahl oder eine Anzeige, die die Kappung aufhebt.
+  const TITLE_RE = /\.(?:list-row__name|task-card__title|contact-item__name|subscription-card__name|rw-standing__name|birthday-item__name|budget-entry__title)$|\.agenda-event__title(?:\s*>\s*span)?$/;
+  const funde = [];
+  for (const name of cssFiles.filter((n) => n !== 'typography.css')) {
+    for (const rule of eachRule(readFileSync(new URL(name, STYLES_DIR), 'utf8'))) {
+      if (!sels(rule).some((sel) => TITLE_RE.test(sel))) continue;
+      if (/white-space:\s*nowrap/.test(rule.body)) funde.push(`${name}: ${rule.selector.trim()} nowrap`);
+      const clamp = rule.body.match(/line-clamp:\s*(\d+)/);
+      if (clamp && clamp[1] !== '2') funde.push(`${name}: ${rule.selector.trim()} line-clamp ${clamp[1]}`);
+      const display = rule.body.match(/(?:^|[;\s])display:\s*([^;]+)/);
+      if (display && !/-webkit-box|flex$/.test(display[1].trim())) funde.push(`${name}: ${rule.selector.trim()} display ${display[1].trim()}`);
+      if (display && /flex/.test(display[1]) && !/agenda-event__title$/.test(rule.selector.trim())) funde.push(`${name}: ${rule.selector.trim()} display ${display[1].trim()}`);
+    }
+  }
+  assert.deepStrictEqual(funde, [], 'eigene Titel-Kuerzung in einem Modul');
+});
+
+// R19 (Critique 2026-10-16, "Ziffern: tabular-nums nur im Zeitraster"): im
+// ganzen Kalender stehen gleich breite Ziffern - Monat, Agenda, Zeitraum-Label.
+// Die Wurzel der Seite traegt sie, alles darunter erbt; keine Regel darunter
+// schaltet sie zurueck.
+test('R19: der Kalender setzt Ziffern ueberall gleich breit', () => {
+  const css = readFileSync(new URL('calendar.css', STYLES_DIR), 'utf8');
+  const root = [...eachRule(css)].filter((r) => !r.at.length && r.selector.trim() === '.calendar-page');
+  assert.ok(root.some((r) => /font-variant-numeric:\s*tabular-nums/.test(r.body)), '.calendar-page traegt tabular-nums');
+  const back = [...eachRule(css)].filter((r) => /font-variant-numeric:\s*(?:normal|proportional-nums)/.test(r.body)).map((r) => r.selector.trim());
+  assert.deepStrictEqual(back, [], 'eine Regel im Kalender schaltet die gleich breiten Ziffern zurueck');
+});
+
+// R19 (Critique 2026-10-16): im Gesundheitsmodul standen 70 Textknoten bei
+// 10px (Zyklus-Legende, Wochentage, Verlaufs-Chips, Labor-Badge, Medikamente).
+// Die Mindestgroesse der Skala ist Caption 2 (`--type-micro`, 11px). Und das
+// Labor spricht EINE Flag-Sprache: jede Abweichung in der Warnfarbe, die
+// Richtung sagen Pfeil und Wort; die Fastenwoche zeichnet im Modulton wie
+// jedes andere Gesundheitsdiagramm.
+test('R19 Gesundheit: keine Schrift unter Caption 2, eine Flag-Sprache, ein Diagrammton', () => {
+  const css = readFileSync(new URL('health.css', STYLES_DIR), 'utf8');
+  assert.doesNotMatch(css, /var\(--text-2xs\)/, 'health.css nutzt 10px (--text-2xs)');
+  for (const rule of eachRule(css)) {
+    const m = rule.body.match(/font-size:\s*(\d+(?:\.\d+)?)px/);
+    if (m) assert.ok(Number(m[1]) >= 11, `${rule.selector}: ${m[0]}`);
+  }
+  const body = (sel) => [...eachRule(css)].find((r) => !r.at.length && r.selector.split(',').map((x) => x.trim()).includes(sel))?.body ?? '';
+  for (const sel of ['.health-lab-flag--low', '.health-lab-flag--high', '.health-lab-rows__row--low .health-lab-rows__value', '.health-lab-rows__row--high .health-lab-rows__value']) {
+    assert.match(body(sel), /color:\s*var\(--color-warning-ink\)/, `${sel} spricht nicht die Flag-Sprache der Befundkarte`);
+  }
+  assert.match(body('.health-lab-badge--warn'), /color:\s*var\(--color-warning-ink\)/);
+  assert.doesNotMatch(css, /fasting-week__[a-z]+[^{]*\{[^}]*chart-series/, 'die Fastenwoche laeuft auf fremden Serienfarben');
 });

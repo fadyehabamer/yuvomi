@@ -457,6 +457,35 @@ test('R16: das Detail traegt ein Kopfbild, wenn es ein eigenes Bild gibt - und n
   assert.ok(ohne.childNodes.length > 0, 'das Detail selbst ist da');
 });
 
+/* REZEPT OHNE BILD (R20, Entscheidung Ulas 2026-10-17): das flache Band im
+ * Kuechenton aus R18 ist weg. Ohne Bild beginnt das Detail mit seinem Inhalt
+ * (Mahlzeit-Chips, Zutaten), den Titel traegt der Kopf des Rahmens. Am Desktop
+ * stand das Band als 480px breiter Stummel ueber den Zutaten. */
+test('R20: ohne Bild beginnt das Detail mit seinem Inhalt - kein Band, kein Platzhalter', async () => {
+  const ohne = document.createElement('div');
+  recipes.fillRecipeDetail(ohne, NATIVE_OHNE_BILD);
+  const [first] = ohne.childNodes;
+  assert.equal(first.className, 'recipe-card__meal-types', 'das Detail beginnt mit den Mahlzeiten, nicht mit einem Band');
+  assert.equal(ohne.childNodes.some((node) => /recipe-detail__(?:band|hero)/.test(node?.className ?? '')), false);
+
+  // Mit Bild bleibt der Hero vorn.
+  const mit = document.createElement('div');
+  recipes.fillRecipeDetail(mit, NATIVE_MIT_BILD);
+  assert.equal(mit.childNodes[0].className, 'recipe-detail__hero');
+
+  const { readFileSync } = await import('node:fs');
+  const thumb = readFileSync(new URL('../public/utils/recipe-thumb.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(thumb, /recipeBandEl|recipe-detail__band/, 'der Baustein des Bands ist weg');
+  // Scheitert das Bild beim Laden, geht der Rahmen mit - ohne Ersatz.
+  const fn = thumb.slice(thumb.indexOf('export function recipeHeroEl('), thumb.indexOf('/**', thumb.indexOf('export function recipeHeroEl(')));
+  assert.match(fn, /addEventListener\('error', \(\) => frame\.remove\(\)/);
+  const page = readFileSync(new URL('../public/pages/recipes.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(page, /recipeBandEl/);
+  const css = readFileSync(new URL('../public/styles/recipes.css', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.doesNotMatch(css, /\.recipe-detail__band/, 'keine Regeln fuer ein Band, das niemand baut');
+});
+
+
 test('R16: das Kopfbild beschneidet (3:2, cover) und verzerrt nicht', async () => {
   const { readFileSync } = await import('node:fs');
   const { eachRule } = await import('./css-rules.js');

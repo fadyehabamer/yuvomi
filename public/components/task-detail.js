@@ -31,10 +31,10 @@
 
 import { api } from '/api.js';
 import { t, formatDate, formatTime } from '/i18n.js';
-import { openDetailView, closeDetailView, visibilityRow, assignedRow } from '/components/detail-view.js';
+import { openDetailView, closeDetailView, visibilityRow } from '/components/detail-view.js';
 import { closeModal, btnLoading, refocusAfterRender } from '/components/modal.js';
 import { recurrenceRow } from '/rrule-ui.js';
-import { scheduleUndoableDelete } from '/utils/ux.js';
+import { scheduleUndoableDelete, acknowledgeCheck, isImeComposing } from '/utils/ux.js';
 import { rowActionEl } from '/utils/row-action.js';
 import { renderMarkdownLight } from '/utils/html.js';
 import { splitKeepingLineEndings } from '/utils/markdown-checklist.js';
@@ -173,14 +173,20 @@ export async function addSubtask(parentId, title, { onChanged = () => {} } = {})
 // keine Durchgangsstation. Es steht nur nicht mehr im Weg.
 const STATUS_ACTIONS = {
   open: [
-    { id: 'task-detail-finish', status: 'done',        labelKey: 'tasks.detailFinish', icon: 'check',      variant: 'secondary' },
+    // ERLEDIGEN IST DIE HAUPTAKTION DER AUFGABE (Critique R18, 2026-10-07;
+    // Ulas 2026-10-16). Der haeufigste Grund, eine Aufgabe zu oeffnen, ist sie
+    // abzuhaken. Deshalb ist die Aufgabe die EINE benannte Ausnahme von
+    // "Bearbeiten ist ueberall primaer" (withPrimaryEdit, `keepPrimary`):
+    // Erledigen bleibt gefuellt, Bearbeiten tritt sekundaer davor.
+    { id: 'task-detail-finish', status: 'done',        labelKey: 'tasks.detailFinish', icon: 'check',      variant: 'primary' },
     { id: 'task-detail-start',  status: 'in_progress', labelKey: 'tasks.detailStart',  icon: 'circle-dot', variant: 'ghost' },
   ],
   in_progress: [
-    { id: 'task-detail-finish', status: 'done',        labelKey: 'tasks.detailFinish', icon: 'check',      variant: 'secondary' },
+    { id: 'task-detail-finish', status: 'done',        labelKey: 'tasks.detailFinish', icon: 'check',      variant: 'primary' },
   ],
+  // Fuer eine erledigte Aufgabe ist der Rueckweg dasselbe: Wieder oeffnen.
   done: [
-    { id: 'task-detail-reopen', status: 'open',        labelKey: 'tasks.detailReopen', icon: 'rotate-ccw', variant: 'secondary' },
+    { id: 'task-detail-reopen', status: 'open',        labelKey: 'tasks.detailReopen', icon: 'rotate-ccw', variant: 'primary' },
   ],
 };
 
@@ -759,7 +765,7 @@ function wireMentionSuggest(field, ctx) {
     if (!box || !matches.length) return;
     if (e.key === 'ArrowDown')      { e.preventDefault(); active = (active + 1) % matches.length; render(); }
     else if (e.key === 'ArrowUp')   { e.preventDefault(); active = (active - 1 + matches.length) % matches.length; render(); }
-    else if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); apply(matches[active]); }
+    else if ((e.key === 'Enter' && !isImeComposing(e)) || e.key === 'Tab') { e.preventDefault(); apply(matches[active]); }
     else if (e.key === 'Escape')    { e.stopPropagation(); close(); }
   });
 
@@ -867,8 +873,22 @@ function taskReminderSummary(reminders) {
     .join(', ');
 }
 
-function renderTaskDetail(task, reminders = [], ctx) {
+/**
+ * Der Kopf der Aufgaben-Leseansicht (components/detail-view.js
+ * `detailHeadEl`): wann sie faellig ist, in den Worten der Liste ("Heute
+ * faellig", "Ueberfaellig · 11.08."), und wer sie hat - als Avatare mit Namen.
+ */
+function taskDetailHead(task) {
   const due = formatDueDate(task.due_date, task.due_time, task.status === 'done' || isArchived(task));
+  return {
+    subtitle: due?.label ?? '',
+    subtitleLabel: t('tasks.dueDateLabel'),
+    people: task.assigned_users ?? [],
+    peopleLabel: t('tasks.assignedLabel'),
+  };
+}
+
+function renderTaskDetail(task, reminders = [], ctx) {
 
   return [
     { icon: 'circle-dot', label: t('tasks.statusLabel'), value: STATUS_LABELS()[task.status] ?? task.status },
@@ -879,11 +899,11 @@ function renderTaskDetail(task, reminders = [], ctx) {
     // Nur wenn gesetzt - eine Zeile "nicht gesperrt" an jeder Aufgabe waere
     // Rauschen. Die leere `value` blendet die Zeile aus (#830).
     { icon: 'lock', label: t('tasks.lockedLabel'), value: task.locked ? t('tasks.lockedDetail') : '' },
-    { icon: 'clock', label: t('tasks.dueDateLabel'), value: due?.label ?? '' },
+    // FAELLIGKEIT und PERSONEN stehen seit R18 im Kopf (taskDetailHead): "Heute
+    // faellig" als die eine Angabe ueber den Zeilen, die Personen als Avatare.
     { icon: 'calendar-clock', label: t('tasks.startDateLabel'), value: task.start_date ? formatDate(task.start_date) : '' },
     recurrenceRow(task.recurrence_rule, { fromCompletion: !!task.recurrence_from_completion }),
     { icon: 'folder', label: t('tasks.categoryLabel'), value: task.category && task.category !== FALLBACK_CATEGORY ? catLabel(task.category, ctx.categories) : '' },
-    assignedRow(task.assigned_users, t('tasks.assignedLabel')),
     { icon: 'award', label: t('tasks.pointsLabel'), value: task.points ? String(task.points) : '' },
     { icon: 'tag', label: t('tasks.tagsLabel'), node: tagChipsNode(task.tags) },
     { icon: 'list-checks', label: t('tasks.subtasksLabel'), node: subtaskListNode(task, ctx) },
@@ -996,6 +1016,7 @@ async function toggleDescriptionCheck(task, box) {
   };
 
   paint(checked);
+  acknowledgeCheck(box, { checked });
   try {
     const res = await api.patch(`/tasks/${task.id}/check`, { line, checked, expect });
     task.description = res.data.description;
@@ -1098,6 +1119,18 @@ export function openTaskDetail({
     },
   }] : [];
 
+  // Ablegen und Zurückholen sind derselbe Schalter - was er tut, hängt daran, wo
+  // die Aufgabe gerade liegt.
+  if (canEdit) {
+    actions.push({
+      id: 'task-detail-archive',
+      label: archived ? t('tasks.unarchiveButton') : t('tasks.archiveButton'),
+      variant: 'ghost',
+      icon: archived ? 'archive-restore' : 'archive',
+      onClick: ({ button, close }) => toggleTaskArchive(task, button, ctx, close),
+    });
+  }
+
   // Der häufigste Grund, eine Aufgabe zu öffnen, ist sie abzuhaken. Bisher
   // führte dieser Weg durch ein Formular mit sieben Auswahlfeldern.
   //
@@ -1111,7 +1144,10 @@ export function openTaskDetail({
   let viewClose = closeDetailView;
   const doers = doerChoices(task, ctx, archived);
   if (!isNavModuleReadOnly('tasks')) {
-    statusActions.forEach((step) => {
+    // Der Primaerknopf (Erledigen/Wieder oeffnen) steht zuletzt, direkt vor
+    // seinem Personenknopf: am Ende des Fusses, wo der Daumen liegt, und
+    // Bearbeiten tritt sekundaer davor (withPrimaryEdit, `keepPrimary`).
+    [...statusActions].sort((a, b) => (a.variant === 'primary') - (b.variant === 'primary')).forEach((step) => {
       actions.push({
         id: step.id,
         label: t(step.labelKey),
@@ -1131,22 +1167,12 @@ export function openTaskDetail({
     });
   }
 
-  // Ablegen und Zurückholen sind derselbe Schalter - was er tut, hängt daran, wo
-  // die Aufgabe gerade liegt.
-  if (canEdit) {
-    actions.push({
-      id: 'task-detail-archive',
-      label: archived ? t('tasks.unarchiveButton') : t('tasks.archiveButton'),
-      variant: 'ghost',
-      icon: archived ? 'archive-restore' : 'archive',
-      onClick: ({ button, close }) => toggleTaskArchive(task, button, ctx, close),
-    });
-  }
-
   // MOBIL EINE REIHE (Re-Critique 2026-09-28, P8 / A3 P3-2): Starten und
   // Archivieren treten auf dem Telefon in EIN Mehr-Menue (detail-view.css);
   // am Desktop stehen sie weiter im Fuss, und dort gibt es den Knopf nicht.
-  const overflowIds = ['task-detail-start', 'task-detail-archive'];
+  // Seit R19 auch Loeschen: mit Loeschen, Bearbeiten, Erledigen, Wer und
+  // Mehr brach der Fuss auf dem Telefon wieder auf zwei Reihen.
+  const overflowIds = ['task-detail-start', 'task-detail-archive', 'task-detail-delete'];
   if (actions.some((a) => overflowIds.includes(a.id))) {
     actions.push({ id: MORE_BUTTON_ID, label: '', variant: 'ghost', icon: 'more-horizontal' });
   }
@@ -1155,6 +1181,7 @@ export function openTaskDetail({
     title: task.title,
     key: `task:${task.id}`,
     size: 'lg',
+    head: taskDetailHead(task),
     // DIE DETAILSPALTE (Liste + Detail, utils/master-detail.js): dieselbe
     // Ansicht, nur in der rechten Spalte statt im Sheet. Bearbeiten fuehrt dort
     // ins eigene Formular-Modal (`edit.standalone`), weil die Spalte ein
@@ -1163,6 +1190,8 @@ export function openTaskDetail({
     onClose: onClose ?? undefined,
     sections: renderTaskDetail(task, reminder, ctx),
     actions,
+    // Erledigen bzw. Wieder oeffnen bleibt der Primaerknopf (siehe STATUS_ACTIONS).
+    keepPrimary: true,
     edit: canEdit && edit ? {
       label: t('common.edit'),
       title: t('tasks.editTask'),
@@ -1180,7 +1209,7 @@ export function openTaskDetail({
 const MORE_BUTTON_ID = 'task-detail-more';
 
 /**
- * Das Mehr-Menue des Detail-Fusses (mobil). Seine Eintraege LOESEN DIE ECHTEN
+ * Das Mehr-Menue des Detail-Fusses (jede Breite). Seine Eintraege LOESEN DIE ECHTEN
  * KNOEPFE AUS, statt eigene Handler zu tragen: Starten und Archivieren bleiben
  * (verborgen) im Fuss, damit statusActionButtons() sie weiter mitsperrt und
  * btnLoading() seinen Knopf findet - ein Handler, eine Sperrlogik.
@@ -1209,7 +1238,9 @@ function wireDetailMoreMenu(task, overflowIds, pane = null) {
     target.classList.add('task-detail__overflow');
     const item = document.createElement('button');
     item.type = 'button';
-    item.className = 'popover-menu__item';
+    // Loeschen bleibt im Menue als destruktiv erkennbar.
+    item.className = target.classList.contains('btn--danger-ghost')
+      ? 'popover-menu__item popover-menu__item--danger' : 'popover-menu__item';
     item.setAttribute('role', 'menuitem');
     const icon = document.createElement('i');
     icon.dataset.lucide = target.querySelector('[data-lucide]')?.dataset.lucide
